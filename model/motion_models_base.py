@@ -185,7 +185,7 @@ class GroupTrackWithoutStruct(GroupTrackMotionModelBase):
         return dX
 
 
-class GroupTrackWithoutMCU(GroupTrackMotionModelBase):
+class GroupTrackWithoutGASF(GroupTrackMotionModelBase):
     """不包含机动补偿单元的群跟踪模型"""
 
     def model_update(self, X, u, static_f):
@@ -205,7 +205,7 @@ class GroupTrackWithoutMCU(GroupTrackMotionModelBase):
         return dX
 
 
-class GroupTrackWithoutStructMCU(GroupTrackMotionModelBase):
+class GroupTrackWithoutStructGASF(GroupTrackMotionModelBase):
     """只包含基本模型的群跟踪模型 (无结构和机动补偿)"""
 
     def model_update(self, X, u, static_f):
@@ -225,5 +225,5 @@ class GroupTrackWithoutStructMCU(GroupTrackMotionModelBase):
 # 向后兼容的别名
 SecondOrderNeuralODE_groupTrack = GroupTrackFullModel
 SecondOrderNeuralODE_groupTrack_without_struct = GroupTrackWithoutStruct
-SecondOrderNeuralODE_groupTrack_without_MCU = GroupTrackWithoutMCU
-SecondOrderNeuralODE_groupTrack_without_struct_MCU = GroupTrackWithoutStructMCU
+SecondOrderNeuralODE_groupTrack_without_GASF = GroupTrackWithoutGASF
+SecondOrderNeuralODE_groupTrack_without_struct_GASF = GroupTrackWithoutStructGASF

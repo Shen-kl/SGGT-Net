@@ -26,7 +26,7 @@ def extract_upper_triangle(A):
     row, col = torch.triu_indices(N, N, offset=1, device=A.device)
     return A[ row, col]   # [B, E]
 
-class StructuralGNN(nn.Module):
+class SEAN(nn.Module):
     """
     Learn symmetric adjacency matrix and structural embeddings.
     """
@@ -39,13 +39,6 @@ class StructuralGNN(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim)
-        )
-
-        self.pair_mlp = nn.Sequential(
-            nn.Linear(2 * hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, 1)
         )
 
         self.struct_proj = nn.Linear(hidden_dim, struct_dim)
@@ -307,12 +300,12 @@ class GRUGNNEncoder(nn.Module):
 class GRUGNNDecoder(nn.Module):
     def __init__(self, motion_model, delta_T, max_length=10, hidden_size=64,
                  n_heads=3, n_layers=1, alpha=0.2, dropout=0.1, residual_length=[8, 16, 32], z_dimension=2,
-                 gnn_layer="graphconv", use_MCU=True, decoder_use_struct=True):
+                 gnn_layer="graphconv", use_GASF=True, decoder_use_struct=True):
         super().__init__()
         self.gru_cell = GRUGNNCell(hidden_size, hidden_size, n_heads, n_layers, dropout,
                                    gnn_layer, edge_dim=1)
         self.alpha = alpha
-        self.use_MCU = use_MCU
+        self.use_GASF = use_GASF
         self.decoder_use_struct = decoder_use_struct
         self.motion_model = motion_model
         self.input_size = motion_model.n_states
@@ -342,15 +335,15 @@ class GRUGNNDecoder(nn.Module):
 
         self.pairwise_g = ResMLP(hidden_size, hidden_size, int(self.input_size * self.mixtures),2)
         # struct
-        self.structuralGNN = StructuralGNN(hidden_size,hidden_size,hidden_size)
+        self.SEAN = SEAN(hidden_size,hidden_size,hidden_size)
 
-        self.MCU = nn.ModuleList(ManuverCompensationUnit(fft_point=256, n_heads=2, n_layers=2, dropout=0.1, gnn_layer="graphconv")
+        self.GASF = nn.ModuleList(GraphSpectralFilter(fft_point=64, n_heads=2, n_layers=2, dropout=0.1, gnn_layer="graphconv")
                                    for _ in range(len(residual_length)))
 
-        self.MCU_linear = ResMLP(np.sum(np.stack(residual_length)) * z_dimension, hidden_size, int(self.output_size * self.mixtures * 2), layer_num=2, dropout_rate=0.1)
+        self.GASF_linear = ResMLP(np.sum(np.stack(residual_length)) * z_dimension, hidden_size, int(self.output_size * self.mixtures * 2), layer_num=2, dropout_rate=0.1)
         self.residual_length = residual_length
 
-        self.linear_mcu = nn.ModuleList( nn.Linear(residual_length[_], 1) for _ in range(len(residual_length)))
+        self.linear_GASF = nn.ModuleList( nn.Linear(residual_length[_], 1) for _ in range(len(residual_length)))
 
         self.delta_T = delta_T
 
@@ -396,23 +389,23 @@ class GRUGNNDecoder(nn.Module):
         delta_comp_last_frame = []
         cnt = 0
 
-        for MCU_single in self.MCU:
-            delta_comp_single, gate_final = MCU_single(residual[:,-self.residual_length[cnt]:,:], nan_mask, edge_index, None, edge_feature)
+        for GASF_single in self.GASF:
+            delta_comp_single, gate_final = GASF_single(residual[:,-self.residual_length[cnt]:,:], nan_mask, edge_index, None, edge_feature)
             delta_comp.append(delta_comp_single.permute(0, 2, 1))
             delta_comp_last_frame.append(delta_comp_single[:,-1,:]) # 只取最后一帧作为补偿
             cnt+=1
 
         delta_comp_last_frame = torch.stack(delta_comp_last_frame,dim=2)
 
-        mcu_alpha = []
+        GASF_alpha = []
         cnt = 0
-        for linear_mcu_single in self.linear_mcu:
-            mcu_alpha.append(linear_mcu_single(delta_comp[cnt]))
+        for linear_GASF_single in self.linear_GASF:
+            GASF_alpha.append(linear_GASF_single(delta_comp[cnt]))
             cnt+=1
 
-        mcu_alpha = torch.softmax(torch.cat(mcu_alpha,dim=2), dim=2)
+        GASF_alpha = torch.softmax(torch.cat(GASF_alpha,dim=2), dim=2)
 
-        delta_comp_final = CONFIG['S_RES'] / CONFIG['S_VEL'] * torch.sum(delta_comp_last_frame * mcu_alpha, dim=-1)
+        delta_comp_final = CONFIG['S_RES'] / CONFIG['S_VEL'] * torch.sum(delta_comp_last_frame * GASF_alpha, dim=-1)
 
 
         # attention 输出
@@ -432,7 +425,7 @@ class GRUGNNDecoder(nn.Module):
         output = F.leaky_relu(output, self.alpha)
         hidden = self.gru_cell(output, edge_index, hidden, edge_attr=self.edge_projector(edge_feature.to(torch.float32)))
 
-        A_vec, struct_feats, A_vec_mask_output, struct_acc, total_group_num = self.structuralGNN(batch, past_state, hidden, mask=torch.all(nan_mask[:,-2:,-1],dim=1).unsqueeze(1))
+        A_vec, struct_feats, A_vec_mask_output, struct_acc, total_group_num = self.SEAN(batch, past_state, hidden, mask=torch.all(nan_mask[:,-2:,-1],dim=1).unsqueeze(1))
 
         output = F.leaky_relu(self.generator(F.leaky_relu(hidden, self.alpha)), self.alpha)
         output = self.dropout(output)
@@ -450,7 +443,7 @@ class GRUGNNDecoder(nn.Module):
         noise_feat3 = torch.cat([x3, delta_comp_final_linear], dim=-1)
         process_noise = self.process_noise_matrix(noise_feat1, noise_feat2, noise_feat3, batch_size, struct_feats)
 
-        if self.use_MCU:
+        if self.use_GASF:
             if self.decoder_use_struct:
                 model_input = torch.cat([x_model_input,struct_acc,delta_comp_final.unsqueeze(1)], dim=-1)
             else:
@@ -469,9 +462,9 @@ class GRUGNNDecoder(nn.Module):
         return last_enc_state
 
 
-class ManuverCompensationUnit(nn.Module):
+class GraphSpectralFilter(nn.Module):
     def __init__(self, fft_point, n_heads, n_layers, dropout, gnn_layer):
-        super(ManuverCompensationUnit, self).__init__()
+        super(GraphSpectralFilter, self).__init__()
         self.fft_point = fft_point
 
         self.freqs = torch.linspace(0, 1, self.fft_point // 2 + 1)
@@ -553,37 +546,6 @@ class ManuverCompensationUnit(nn.Module):
 
         # frequency_spectrum_save_real = frequency_spectrum_real * gate_final[...,0] - frequency_spectrum_imag * gate_final[...,1]
         # frequency_spectrum_save_imag = frequency_spectrum_real * gate_final[...,1] + frequency_spectrum_imag * gate_final[...,0]
-
-        # ===============================
-        # freq_max = 1 / 2
-        # freq_series = np.arange(0, freq_max, freq_max/frequency_spectrum_real.shape[-1])
-        # frequency_spectrum_x_axis = frequency_spectrum_real[0,0,:].detach().numpy().transpose().flatten() + 1j * frequency_spectrum_imag[0,0,:].detach().numpy().transpose().flatten()
-        # frequency_spectrum_save_x_axis = frequency_spectrum_save_real[0, 0, :].detach().numpy().transpose().flatten() + 1j*\
-        #                              frequency_spectrum_save_imag[0, 0, :].detach().numpy().transpose().flatten()
-        #
-        # frequency_spectrum_y_axis = frequency_spectrum_real[0,1,:].detach().numpy().transpose().flatten() + 1j * frequency_spectrum_imag[0,1,:].detach().numpy().transpose().flatten()
-        # frequency_spectrum_save_y_axis = frequency_spectrum_save_real[0, 1, :].detach().numpy().transpose().flatten() + 1j*\
-        #                              frequency_spectrum_save_imag[0, 1, :].detach().numpy().transpose().flatten()
-        # plt.figure()
-        # plt.plot(freq_series,abs(frequency_spectrum_x_axis))
-        # plt.plot(freq_series,abs(frequency_spectrum_save_x_axis))
-        #
-        # plt.figure()
-        # plt.plot(freq_series,abs(frequency_spectrum_y_axis))
-        # plt.plot(freq_series,abs(frequency_spectrum_save_y_axis))
-        #
-        # plt.show()
-        #
-        # result_dict = {'freq_series': freq_series, 'frequency_spectrum_x_axis': frequency_spectrum_x_axis,
-        #                'frequency_spectrum_save_x_axis': frequency_spectrum_save_x_axis, 'frequency_spectrum_y_axis': frequency_spectrum_y_axis,
-        #                'frequency_spectrum_save_y_axis': frequency_spectrum_save_y_axis}
-        # f_save = open('../result_data/freq_domain_ablation_study_no_manuver.pkl', 'wb')
-        # pickle.dump(result_dict, f_save)
-        # f_save.close()
-
-        # ===============================
-
-
         #
         # =================================
         manuver_compensation = torch.fft.ifft(torch.complex(frequency_spectrum_save_real, frequency_spectrum_save_imag),
@@ -605,21 +567,21 @@ class ManuverCompensationUnit(nn.Module):
         return self.out_proj(manuver_compensation_downsample.permute(0, 2, 1)), gate_final
 
 
-class MCU(nn.Module):
-    def __init__(self, MCU_layer, gnn_hidden_dim,gnn_n_heads=4, gnn_layers=2, gnn_dropout=0.1, gnn_layer="gat"):
-        super(MCU, self).__init__()
+class GASF(nn.Module):
+    def __init__(self, GASF_layer, gnn_hidden_dim,gnn_n_heads=4, gnn_layers=2, gnn_dropout=0.1, gnn_layer="gat"):
+        super(GASF, self).__init__()
         cell_list = nn.ModuleList([])
-        for i in range(MCU_layer):
+        for i in range(GASF_layer):
             cell_list.append(
-                ManuverCompensationUnit(gnn_hidden_dim,gnn_n_heads, gnn_layers, gnn_dropout, gnn_layer)
+                GraphSpectralFilter(gnn_hidden_dim,gnn_n_heads, gnn_layers, gnn_dropout, gnn_layer)
             )
 
         self.manuverCompensationLayer = cell_list
 
-    def forward(self,normalized_detection_MCU: torch.Tensor, normalized_update_history_MCU: torch.Tensor):
+    def forward(self,normalized_detection_GASF: torch.Tensor, normalized_update_history_GASF: torch.Tensor):
         # # 残差 保留高频分量 高频分量意味着机动残差
-        innovationError = (normalized_detection_MCU\
-                          - normalized_update_history_MCU[:,:,0::2]).unsqueeze(dim=3)
+        innovationError = (normalized_detection_GASF\
+                          - normalized_update_history_GASF[:,:,0::2]).unsqueeze(dim=3)
         x = innovationError
         manuver_compensation_input_list = []
         manuver_compensation_output_list = []

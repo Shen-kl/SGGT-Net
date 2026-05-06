@@ -100,7 +100,7 @@ class Args:
         parser.add_argument('--n-mixtures', type=int, default=1,
                             help='number of mixtures (default: 8)')
         parser.add_argument('--motion-model', type=str, default='group',
-                            help='choice of motion model (default: 2Xnode)') #  group_residual / group_residual_without_MCU
+                            help='choice of motion model (default: 2Xnode)')  
         parser.add_argument('--n-ode-hidden', type=int, default=64,
                             help='n graph layers (default: 16)') # residula: 64
         parser.add_argument('--n-ode-layers', type=int, default=3,
@@ -128,7 +128,7 @@ class Args:
         parser.add_argument('--decoder_residual_length', default=[16], type=list)  #
         parser.add_argument('--decoder_z_dimension', default=2, type=float)  #
         parser.add_argument('--decoder_node_num', default=200, type=int) # 允许跟踪的最大目标数量
-        parser.add_argument('--decoder_use_MCU', default=True, type=bool)
+        parser.add_argument('--decoder_use_GASF', default=True, type=bool)
         parser.add_argument('--decoder_use_struct', default=True, type=bool)
 
 

@@ -779,18 +779,18 @@ class Radar:
             self.mcst_normalize(estimation_history, detections_history, input_sigma,
                             self.neural_network['minMaxScaler'], self.neural_network['mcst_args'].predictor_time_series_len))
 
-        normalized_update_history_MCU, normalized_detections_MCU, _ = (
+        normalized_update_history_GASF, normalized_detections_GASF, _ = (
             self.mcst_normalize(estimation_history, detections_history, input_sigma,
-                            self.neural_network['minMaxScaler_MCU'], self.neural_network['mcst_args'].predictor_MCU_len))
+                            self.neural_network['minMaxScaler_GASF'], self.neural_network['mcst_args'].predictor_GASF_len))
 
         # 预测
         normalized_update_history = normalized_update_history.squeeze(dim=2)
-        normalized_detections_MCU = normalized_detections_MCU.squeeze(dim=2)
-        normalized_update_history_MCU = normalized_update_history_MCU.squeeze(dim=2)
+        normalized_detections_GASF = normalized_detections_GASF.squeeze(dim=2)
+        normalized_update_history_GASF = normalized_update_history_GASF.squeeze(dim=2)
 
         output_normalized_predict, output_predict_sigma, (track.avbt_predictor_h, track.avbt_predictor_c) = \
-            self.neural_network['model'].predict(input_sigma, normalized_update_history, normalized_detections_MCU,
-                                           normalized_update_history_MCU,
+            self.neural_network['model'].predict(input_sigma, normalized_update_history, normalized_detections_GASF,
+                                           normalized_update_history_GASF,
                                            (track.avbt_predictor_h, track.avbt_predictor_c))
 
         # 反归一化

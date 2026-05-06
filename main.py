@@ -2,8 +2,8 @@ from data.load_data import *
 import torch
 import numpy as np
 from loguru import logger
-from model.sggt_net_optimized import SGGT_Net
-from train.trainer_optimized import *
+from model.sggt_net import SGGT_Net
+from train.trainer import *
 from torch_geometric.loader import DataLoader
 from config import *
 from model.motion_models import *
@@ -60,8 +60,8 @@ if __name__ == '__main__':
         m_model = SecondOrderNeuralODE(solver=args.ode_solver, dt=args.T, mixtures=args.n_mixtures,
                                        static_f_dim=0, n_hidden=args.n_ode_hidden,
                                        n_layers=args.n_ode_layers)
-    elif args.motion_model == 'group_residual_without_MCU':
-        m_model = SecondOrderNeuralODE_groupTrack_without_MCU(solver=args.ode_solver, dt=args.T,
+    elif args.motion_model == 'group_residual_without_GASF':
+        m_model = SecondOrderNeuralODE_groupTrack_without_GASF(solver=args.ode_solver, dt=args.T,
                                                               mixtures=args.n_mixtures,
                                                               static_f_dim=0, n_hidden=args.n_ode_hidden,
                                                               n_layers=args.n_ode_layers)
@@ -70,8 +70,8 @@ if __name__ == '__main__':
                                                                  mixtures=args.n_mixtures,
                                                                  static_f_dim=0, n_hidden=args.n_ode_hidden,
                                                                  n_layers=args.n_ode_layers)
-    elif args.motion_model == 'group_residual_without_struct_MCU':
-        m_model = SecondOrderNeuralODE_groupTrack_without_struct_MCU(solver=args.ode_solver, dt=args.T,
+    elif args.motion_model == 'group_residual_without_struct_GASF':
+        m_model = SecondOrderNeuralODE_groupTrack_without_struct_GASF(solver=args.ode_solver, dt=args.T,
                                                                      mixtures=args.n_mixtures,
                                                                      static_f_dim=0, n_hidden=args.n_ode_hidden,
                                                                      n_layers=args.n_ode_layers)
@@ -88,7 +88,7 @@ if __name__ == '__main__':
                                  args.decoder_n_heads, args.decoder_n_layers, args.decoder_alpha,
                                  args.decoder_dropout, args.decoder_residual_length,
                                  args.decoder_z_dimension, args.decoder_gnn_layer,
-                                 args.decoder_use_MCU, args.decoder_use_struct, args.T)
+                                 args.decoder_use_GASF, args.decoder_use_struct, args.T)
 
 
 

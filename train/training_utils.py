@@ -258,7 +258,6 @@ class TrainingMetrics:
             'velocity_rmse_update': [],
             'location_rmse_measurement': [],
             'f1': [],
-            'x_update_renorm': []
         }
 
     def add_batch_metrics(self, batch_metrics):

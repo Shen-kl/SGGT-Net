@@ -185,8 +185,8 @@ def param_config(trajectory_info, measurement_noise_std):
                                                                    mixtures=args.n_mixtures,
                                                                    static_f_dim=0, n_hidden=args.n_ode_hidden,
                                                                    n_layers=args.n_ode_layers)
-                                elif args.motion_model == 'group_residual_without_MCU':
-                                    m_model = SecondOrderNeuralODE_groupTrack_without_MCU(solver=args.ode_solver, dt=args.T,
+                                elif args.motion_model == 'group_residual_without_GASF':
+                                    m_model = SecondOrderNeuralODE_groupTrack_without_GASF(solver=args.ode_solver, dt=args.T,
                                                                    mixtures=args.n_mixtures,
                                                                    static_f_dim=0, n_hidden=args.n_ode_hidden,
                                                                    n_layers=args.n_ode_layers)
@@ -195,8 +195,8 @@ def param_config(trajectory_info, measurement_noise_std):
                                                                    mixtures=args.n_mixtures,
                                                                    static_f_dim=0, n_hidden=args.n_ode_hidden,
                                                                    n_layers=args.n_ode_layers)
-                                elif args.motion_model == 'group_residual_without_struct_MCU':
-                                    m_model = SecondOrderNeuralODE_groupTrack_without_struct_MCU(solver=args.ode_solver, dt=args.T,
+                                elif args.motion_model == 'group_residual_without_struct_GASF':
+                                    m_model = SecondOrderNeuralODE_groupTrack_without_struct_GASF(solver=args.ode_solver, dt=args.T,
                                                                    mixtures=args.n_mixtures,
                                                                    static_f_dim=0, n_hidden=args.n_ode_hidden,
                                                                    n_layers=args.n_ode_layers)
@@ -216,7 +216,7 @@ def param_config(trajectory_info, measurement_noise_std):
                                                     args.decoder_n_heads, args.decoder_n_layers, args.decoder_alpha,
                                                     args.decoder_dropout,  args.decoder_residual_length,
                                                              args.decoder_z_dimension, args.decoder_gnn_layer,
-                                 args.decoder_use_MCU, args.decoder_use_struct, delta_T)
+                                 args.decoder_use_GASF, args.decoder_use_struct, delta_T)
                                 # 加载模型参数
                                 track_model.load_state_dict(
                                     torch.load(args.checkpoint, map_location=torch.device('cpu'))['state_dict'])
