@@ -125,11 +125,11 @@ class Args:
         parser.add_argument('--decoder_alpha', default=0.2, type=float)  #
         parser.add_argument('--decoder_dropout', default=0.1, type=float)  #
         parser.add_argument('--decoder_gnn_layer', default="graphconv", type=str)  #
-        parser.add_argument('--decoder_residual_length', default=[16], type=list)  #
+        parser.add_argument('--decoder_residual_length', default=[8,16], type=list)  #
         parser.add_argument('--decoder_z_dimension', default=2, type=float)  #
         parser.add_argument('--decoder_node_num', default=200, type=int) # 允许跟踪的最大目标数量
         parser.add_argument('--decoder_use_GASF', default=True, type=bool)
-        parser.add_argument('--decoder_use_struct', default=True, type=bool)
+        parser.add_argument('--decoder_use_SEAN', default=True, type=bool)
 
 
         parser.add_argument('--neural_net', default='sggt_net', type=str)  # baseline/ sggt_net/  MCST

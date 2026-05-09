@@ -5,7 +5,9 @@ from utils.common.kalman_filter import KalmanFilter
 from model.sggt_net import SGGT_Net
 
 from config import Args, CONFIG
+from model.motion_models_base import *
 from model.motion_models import *
+
 from utils.common.graph_input_builder import GraphInputBuilder
 import torch
 from utils.mcst.MinMaxScaler import *
@@ -185,27 +187,14 @@ def param_config(trajectory_info, measurement_noise_std):
                                                                    mixtures=args.n_mixtures,
                                                                    static_f_dim=0, n_hidden=args.n_ode_hidden,
                                                                    n_layers=args.n_ode_layers)
-                                elif args.motion_model == 'group_residual_without_GASF':
-                                    m_model = SecondOrderNeuralODE_groupTrack_without_GASF(solver=args.ode_solver, dt=args.T,
-                                                                   mixtures=args.n_mixtures,
-                                                                   static_f_dim=0, n_hidden=args.n_ode_hidden,
-                                                                   n_layers=args.n_ode_layers)
-                                elif args.motion_model == 'group_residual_without_struct':
-                                    m_model = SecondOrderNeuralODE_groupTrack_without_struct(solver=args.ode_solver, dt=args.T,
-                                                                   mixtures=args.n_mixtures,
-                                                                   static_f_dim=0, n_hidden=args.n_ode_hidden,
-                                                                   n_layers=args.n_ode_layers)
-                                elif args.motion_model == 'group_residual_without_struct_GASF':
-                                    m_model = SecondOrderNeuralODE_groupTrack_without_struct_GASF(solver=args.ode_solver, dt=args.T,
-                                                                   mixtures=args.n_mixtures,
-                                                                   static_f_dim=0, n_hidden=args.n_ode_hidden,
-                                                                   n_layers=args.n_ode_layers)
                                 else:
                                     m_model = SecondOrderNeuralODE_groupTrack(solver=args.ode_solver, dt=args.T,
                                                                               mixtures=args.n_mixtures,
                                                                               static_f_dim=0,
                                                                               n_hidden=args.n_ode_hidden,
-                                                                              n_layers=args.n_ode_layers)
+                                                                              n_layers=args.n_ode_layers,
+                                                                              use_SEAN=args.decoder_use_SEAN,
+                                                                              use_GASF=args.decoder_use_GASF)
 
                                 # 神经网络模型
                                 track_model = SGGT_Net(args.encoder_input_size, args.encoder_hidden_size,
@@ -216,10 +205,10 @@ def param_config(trajectory_info, measurement_noise_std):
                                                     args.decoder_n_heads, args.decoder_n_layers, args.decoder_alpha,
                                                     args.decoder_dropout,  args.decoder_residual_length,
                                                              args.decoder_z_dimension, args.decoder_gnn_layer,
-                                 args.decoder_use_GASF, args.decoder_use_struct, delta_T)
+                                 args.decoder_use_GASF, args.decoder_use_SEAN, delta_T)
                                 # 加载模型参数
                                 track_model.load_state_dict(
-                                    torch.load(args.checkpoint, map_location=torch.device('cpu'))['state_dict'])
+                                    torch.load(args.checkpoint, map_location=torch.device('cpu'),weights_only=False)['state_dict'])
 
                                 track_model.eval()
 

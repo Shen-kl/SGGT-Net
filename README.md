@@ -57,7 +57,7 @@ python main.py \
     --lr 1e-3 \
     --motion_model group_residual \
     --decoder_use_GASF True\
-    --decoder_use_struct True
+    --decoder_use_SEAN True
 ```
 
 ---
@@ -260,7 +260,7 @@ model = SGGT_Net(
    decoder_z_dimension=2,
    decoder_gnn_layer="graphconv",
    decoder_use_GASF=True,
-   decoder_use_struct=True,
+   decoder_use_SEAN=True,
    delta_T=0.04
 )
 
@@ -319,7 +319,7 @@ model = SGGT_Net(
    decoder_n_heads=3, decoder_n_layers=1, decoder_alpha=0.2,
    decoder_dropout=0.1, decoder_residual_length=[8, 16, 32],
    decoder_z_dimension=2, decoder_gnn_layer="graphconv",
-   decoder_use_GASF=True, decoder_use_struct=True, delta_T=0.04
+   decoder_use_GASF=True, decoder_use_SEAN=True, delta_T=0.04
 )
 
 # 优化器和调度器

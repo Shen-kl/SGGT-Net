@@ -60,25 +60,10 @@ if __name__ == '__main__':
         m_model = SecondOrderNeuralODE(solver=args.ode_solver, dt=args.T, mixtures=args.n_mixtures,
                                        static_f_dim=0, n_hidden=args.n_ode_hidden,
                                        n_layers=args.n_ode_layers)
-    elif args.motion_model == 'group_residual_without_GASF':
-        m_model = SecondOrderNeuralODE_groupTrack_without_GASF(solver=args.ode_solver, dt=args.T,
-                                                              mixtures=args.n_mixtures,
-                                                              static_f_dim=0, n_hidden=args.n_ode_hidden,
-                                                              n_layers=args.n_ode_layers)
-    elif args.motion_model == 'group_residual_without_struct':
-        m_model = SecondOrderNeuralODE_groupTrack_without_struct(solver=args.ode_solver, dt=args.T,
-                                                                 mixtures=args.n_mixtures,
-                                                                 static_f_dim=0, n_hidden=args.n_ode_hidden,
-                                                                 n_layers=args.n_ode_layers)
-    elif args.motion_model == 'group_residual_without_struct_GASF':
-        m_model = SecondOrderNeuralODE_groupTrack_without_struct_GASF(solver=args.ode_solver, dt=args.T,
-                                                                     mixtures=args.n_mixtures,
-                                                                     static_f_dim=0, n_hidden=args.n_ode_hidden,
-                                                                     n_layers=args.n_ode_layers)
     else:
         m_model = SecondOrderNeuralODE_groupTrack(solver=args.ode_solver, dt=args.T, mixtures=args.n_mixtures,
                                        static_f_dim=0, n_hidden=args.n_ode_hidden,
-                                       n_layers=args.n_ode_layers)
+                                       n_layers=args.n_ode_layers, use_SEAN=args.decoder_use_SEAN, use_GASF=args.decoder_use_GASF)
     # 模型
     track_model = SGGT_Net(args.encoder_input_size, args.encoder_hidden_size,
                                  args.encoder_n_heads,
@@ -88,7 +73,7 @@ if __name__ == '__main__':
                                  args.decoder_n_heads, args.decoder_n_layers, args.decoder_alpha,
                                  args.decoder_dropout, args.decoder_residual_length,
                                  args.decoder_z_dimension, args.decoder_gnn_layer,
-                                 args.decoder_use_GASF, args.decoder_use_struct, args.T)
+                                 args.decoder_use_GASF, args.decoder_use_SEAN, args.T)
 
 
 

@@ -38,18 +38,21 @@ class SEAN(nn.Module):
             nn.Linear(in_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim)
+            nn.Linear(hidden_dim, 1)
         )
 
         self.struct_proj = nn.Linear(hidden_dim, struct_dim)
 
-        self.embedding_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh()  # 限制范围有助于稳定
+        self.embedding = nn.Sequential(
+            nn.Linear(4, hidden_dim),
         )
+        self.embedding_node = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+
         self.temp = nn.Parameter(torch.tensor(1.0))  # 可学习的缩放参数 (Temperature)
 
-        self.struct_acc = ResMLP(4,hidden_dim,2, layer_num=2)
     def forward(self, batch, x_states, x_hidden, mask=None):
         """
         x: [B, N, d]
@@ -81,7 +84,6 @@ class SEAN(nn.Module):
         A_vec_list = []
         struct_feat_list = []
         node_mask_list = []
-        interaction_list = []
 
         total_group_num = 0 # 群的总数
 
@@ -89,11 +91,13 @@ class SEAN(nn.Module):
             x_state = x_state.squeeze(dim=1)
             N, _ = node_features.shape
 
-            h = self.node_mlp(node_features)  # [N,1,H]
+            # h = self.node_mlp(node_features)  # [N,1,H]
 
-            z = F.normalize(self.embedding_head(h), p=2, dim=-1)  # [N, E] 得到身份嵌入
+            z = self.embedding_node(node_features)
+            x_state_diff_embed = self.embedding(x_state.unsqueeze(dim=1) - x_state.unsqueeze(dim=0))
+            logits = self.node_mlp(z.unsqueeze(dim = 1) + z.unsqueeze(dim=0) + x_state_diff_embed).squeeze()  # [N, E] 得到身份嵌入
 
-            logits = torch.matmul(z, z.transpose(-1, -2)) / self.temp
+            # logits = torch.matmul(z, z.transpose(-1, -2)) / self.temp
 
             A = torch.sigmoid(logits)
             A_tmp = A.clone() # 用于计算群个数
@@ -115,37 +119,28 @@ class SEAN(nn.Module):
             total_group_num += groups_num
 
             # ---- 结构 embedding ----
-            struct_feat = torch.matmul(A, h)  # 图聚合
+            struct_feat = torch.matmul(A, z)  # 图聚合
             struct_feat = self.struct_proj(struct_feat)
 
             node_mask_vec = extract_upper_triangle(node_mask)
             A_vec = extract_upper_triangle(A)
 
-            # --- 计算群结构 输出的加速度
-            A = A / (A.sum(-1, keepdim=True) + 1e-6) # 归一化
-            neigh = A @ x_state
-            interaction = neigh - x_state
-            interaction = self.struct_acc(interaction)
-
             A_vec_list.append(A_vec)
             struct_feat_list.append(struct_feat)
             node_mask_list.append(node_mask_vec)
-            interaction_list.append(interaction)
 
         # 拼接结果
         A_vec_sorted = torch.cat(A_vec_list, dim=-1)
         struct_feat_sorted = torch.cat(struct_feat_list, dim=0)
         node_mask_sorted = torch.cat(node_mask_list, dim=-1)
-        interaction_sorted = torch.cat(interaction_list,dim=0).unsqueeze(1)
 
 
         # 恢复原始顺序
         A_vec_output = A_vec_sorted
         struct_feat_output = struct_feat_sorted[inverse_indices]
         node_mask_output = node_mask_sorted
-        interaction_output = interaction_sorted[inverse_indices]
 
-        return A_vec_output, struct_feat_output, node_mask_output, interaction_output, total_group_num
+        return A_vec_output, struct_feat_output, node_mask_output, total_group_num
 
     def count_groups_torch(self, A):
 
@@ -329,9 +324,9 @@ class GRUGNNDecoder(nn.Module):
         self.controller = nn.Linear(hidden_size, int(self.input_size * self.mixtures))
 
         # To generate process noise
-        self.sig_1 = nn.Linear(hidden_size * 2, int(self.mixtures))
-        self.sig_2 = nn.Linear(hidden_size * 2, int(self.mixtures))
-        self.rho = nn.Linear(hidden_size * 2, int(self.mixtures))
+        self.sig_1 = nn.Linear(hidden_size , int(self.mixtures))
+        self.sig_2 = nn.Linear(hidden_size , int(self.mixtures))
+        self.rho = nn.Linear(hidden_size , int(self.mixtures))
 
         self.pairwise_g = ResMLP(hidden_size, hidden_size, int(self.input_size * self.mixtures),2)
         # struct
@@ -340,10 +335,9 @@ class GRUGNNDecoder(nn.Module):
         self.GASF = nn.ModuleList(GraphSpectralFilter(fft_point=64, n_heads=2, n_layers=2, dropout=0.1, gnn_layer="graphconv")
                                    for _ in range(len(residual_length)))
 
-        self.GASF_linear = ResMLP(np.sum(np.stack(residual_length)) * z_dimension, hidden_size, int(self.output_size * self.mixtures * 2), layer_num=2, dropout_rate=0.1)
         self.residual_length = residual_length
 
-        self.linear_GASF = nn.ModuleList( nn.Linear(residual_length[_], 1) for _ in range(len(residual_length)))
+        self.linear_GASF = nn.ModuleList( nn.Linear(hidden_size, 1) for _ in range(len(residual_length)))
 
         self.delta_T = delta_T
 
@@ -385,27 +379,26 @@ class GRUGNNDecoder(nn.Module):
         x, hidden, encoder_out, edge_index, edge_feature, past_state, batch, nan_mask, residual = data
         batch_size = x.size(0)
 
-        delta_comp = []
+        GASF_output_list = []
         delta_comp_last_frame = []
         cnt = 0
-
+        # 频域处理
         for GASF_single in self.GASF:
             delta_comp_single, gate_final = GASF_single(residual[:,-self.residual_length[cnt]:,:], nan_mask, edge_index, None, edge_feature)
-            delta_comp.append(delta_comp_single.permute(0, 2, 1))
-            delta_comp_last_frame.append(delta_comp_single[:,-1,:]) # 只取最后一帧作为补偿
+            GASF_output_list.append(delta_comp_single)
             cnt+=1
 
-        delta_comp_last_frame = torch.stack(delta_comp_last_frame,dim=2)
+        GASF_output_stack = torch.stack(GASF_output_list,dim=1)
 
         GASF_alpha = []
         cnt = 0
         for linear_GASF_single in self.linear_GASF:
-            GASF_alpha.append(linear_GASF_single(delta_comp[cnt]))
+            GASF_alpha.append(linear_GASF_single(GASF_output_list[cnt]))
             cnt+=1
 
-        GASF_alpha = torch.softmax(torch.cat(GASF_alpha,dim=2), dim=2)
+        GASF_alpha = torch.sigmoid(torch.cat(GASF_alpha,dim=1))
 
-        delta_comp_final = CONFIG['S_RES'] / CONFIG['S_VEL'] * torch.sum(delta_comp_last_frame * GASF_alpha, dim=-1)
+        GASF_output_fusion = torch.sum(GASF_output_stack * GASF_alpha[...,None], dim=1)
 
 
         # attention 输出
@@ -425,34 +418,27 @@ class GRUGNNDecoder(nn.Module):
         output = F.leaky_relu(output, self.alpha)
         hidden = self.gru_cell(output, edge_index, hidden, edge_attr=self.edge_projector(edge_feature.to(torch.float32)))
 
-        A_vec, struct_feats, A_vec_mask_output, struct_acc, total_group_num = self.SEAN(batch, past_state, hidden, mask=torch.all(nan_mask[:,-2:,-1],dim=1).unsqueeze(1))
+        A_vec, struct_feats, A_vec_mask_output, total_group_num = self.SEAN(batch, past_state, hidden, mask=torch.all(nan_mask[:,-2:,-1],dim=1).unsqueeze(1))
 
         output = F.leaky_relu(self.generator(F.leaky_relu(hidden, self.alpha)), self.alpha)
         output = self.dropout(output)
 
         x1, x2, x3, x4 = torch.split(output, self.hidden_size, dim=-1)
-        x_model_input = self.controller(x4).view(batch_size,
-                                               self.mixtures,
-                                               self.input_size)
+        # x_model_input = self.controller(x4).view(batch_size,
+        #                                        self.mixtures,
+        #                                        self.input_size)
 
-        # struct_u = self.pairwise_g(struct_feats).view(batch_size, self.mixtures, self.input_size)
-
-        delta_comp_final_linear = self.linear_1(delta_comp_final)
-        noise_feat1 = torch.cat([x1, delta_comp_final_linear],dim=-1)
-        noise_feat2 = torch.cat([x2, delta_comp_final_linear], dim=-1)
-        noise_feat3 = torch.cat([x3, delta_comp_final_linear], dim=-1)
+        noise_feat1 = torch.cat([x1],dim=-1)
+        noise_feat2 = torch.cat([x2], dim=-1)
+        noise_feat3 = torch.cat([x3], dim=-1)
         process_noise = self.process_noise_matrix(noise_feat1, noise_feat2, noise_feat3, batch_size, struct_feats)
 
+        model_input = {}
+        model_input['gnn_model_output'] = x4
         if self.use_GASF:
-            if self.decoder_use_struct:
-                model_input = torch.cat([x_model_input,struct_acc,delta_comp_final.unsqueeze(1)], dim=-1)
-            else:
-                model_input = torch.cat([x_model_input, delta_comp_final.unsqueeze(1)], dim=-1)
-        else:
-            if self.decoder_use_struct:
-                model_input = torch.cat([x_model_input, struct_acc], dim=-1)
-            else:
-                model_input = x_model_input
+            model_input['struct_feats'] = struct_feats
+        if self.decoder_use_struct:
+            model_input['GASF_output_fusion'] = GASF_output_fusion
 
         next_state, model_input = self.motion_model(past_state, model_input, static_f=None)
 
@@ -470,7 +456,7 @@ class GraphSpectralFilter(nn.Module):
         self.freqs = torch.linspace(0, 1, self.fft_point // 2 + 1)
 
 
-        self.gate = ResMLP((64+2) * 2, (64+2),
+        self.gate = ResMLP((fft_point+2) * 2, (fft_point+2),
                             3 * 2 * 2, 2, 0.1)
         self.sigmoid = nn.Sigmoid()
         self.norm = nn.LayerNorm((self.fft_point+2) * 2)
@@ -479,9 +465,9 @@ class GraphSpectralFilter(nn.Module):
                                    gnn_layer)
 
         self.edge_projector  = EdgeProjector()
-        self.feature_dim = 2
+        self.feature_dim = fft_point
         self.out_proj = nn.Sequential(
-            nn.Linear(self.feature_dim, self.feature_dim),
+            nn.Linear(self.feature_dim * 2, self.feature_dim),
             nn.SiLU(),
             nn.Linear(self.feature_dim, self.feature_dim)
         )
@@ -561,10 +547,11 @@ class GraphSpectralFilter(nn.Module):
         #                         manuver_compensation_output[:,:,:,1]**2)**0.5
         # =================================
 
-        manuver_compensation_downsample = manuver_compensation[:, :, :innovationError_reshape.shape[2]]
+        manuver_compensation_latent = self.out_proj(manuver_compensation.reshape(batch_size, -1))
+        # manuver_compensation_downsample = manuver_compensation[:, :, :innovationError_reshape.shape[2]]
 
-        manuver_compensation_downsample = self.temporal_conv(manuver_compensation_downsample)
-        return self.out_proj(manuver_compensation_downsample.permute(0, 2, 1)), gate_final
+        # manuver_compensation_downsample = self.temporal_conv(manuver_compensation_downsample)
+        return manuver_compensation_latent, gate_final
 
 
 class GASF(nn.Module):

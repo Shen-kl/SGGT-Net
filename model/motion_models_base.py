@@ -20,7 +20,7 @@ class GroupTrackMotionModelBase(nn.Module):
     """
 
     def __init__(self, solver='rk4', dt=4e-2, n_states=4, mixtures=8, static_f_dim=8,
-                 n_hidden=32, n_layers=2, *u_lims):
+                 n_hidden=128, n_layers=2, use_SEAN=True, use_GASF=True, *u_lims):
         super().__init__()
         self.dt = dt
         self.mixtures = mixtures
@@ -28,7 +28,7 @@ class GroupTrackMotionModelBase(nn.Module):
         self.static_f_dim = static_f_dim
         self.n_inputs = len(u_lims)
         self.solver = solvers[solver]
-
+        self.n_hidden = n_hidden
         # 输入约束
         self.u_constrain = []
         for u_lim in u_lims:
@@ -41,9 +41,25 @@ class GroupTrackMotionModelBase(nn.Module):
         self._init_state_parameters()
 
         # 神经网络 backbone
-        self.backbone = ResMLP(8, 128, 2, layer_num=3, dropout_rate=0.1)
+        self.backbone = ResMLP(self.n_hidden * 2, self.n_hidden, 2, layer_num=3, dropout_rate=0.1)
+        self.x_embeding = nn.Linear(self.n_states, self.n_hidden)
+        feature_cnt = 1 + int(use_SEAN) + int(use_GASF)
+        self.alpha_net = nn.Linear(self.n_hidden * feature_cnt, feature_cnt)
         self.config = CONFIG
-
+        self.proj = [nn.Sequential(
+            nn.Linear(self.n_hidden, self.n_hidden), nn.LayerNorm(self.n_hidden), nn.LeakyReLU()
+        ) for _ in range(feature_cnt)]
+        self.proj_res = nn.Sequential(
+            nn.Linear(self.n_hidden, self.n_hidden), nn.LayerNorm(self.n_hidden), nn.LeakyReLU()
+        )
+        self.proj_struct = nn.Sequential(
+            nn.Linear(self.n_hidden, self.n_hidden), nn.LayerNorm(self.n_hidden), nn.LeakyReLU()
+        )
+        self.gate = nn.Sequential(
+            nn.Linear(self.n_hidden * feature_cnt, self.n_hidden * feature_cnt),
+            nn.Sigmoid()  # 每个通道独立0~1
+        )
+        self.fusion =ResMLP(self.n_hidden,self.n_hidden,self.n_hidden,2,0.1)
     def _build_input_transition_matrix(self):
         """构建输入转移矩阵 G"""
         G = torch.zeros(1, self.mixtures, self.n_states, 2)
@@ -100,14 +116,19 @@ class GroupTrackMotionModelBase(nn.Module):
         """
         从控制输入中提取各分量
 
-        Returns:
-            dict: {'u_x': 基础输入, 'u_acc': 加速度, 'u_struct_acc': 结构加速度}
         """
-        return {
-            'u_x': u[..., :-4],
-            'u_acc': u[..., -2:],
-            'u_struct_acc': u[..., -4:-2]
-        }
+        v_list = []
+        for idx, (k, v) in enumerate(u.items()):
+            v_list.append(self.proj[idx](v))
+        v_stack = torch.cat(v_list, dim=-1)
+
+        alpha = self.gate(v_stack)
+        gated = alpha * v_stack
+
+        v_fusion = self.fusion(gated[...,:self.n_hidden]+gated[...,self.n_hidden:2*self.n_hidden]+gated[...,2*self.n_hidden:3*self.n_hidden])
+
+
+        return v_fusion
 
     def _compute_acceleration(self, inputs, X):
         """计算加速度 (由子类实现)"""
@@ -115,13 +136,11 @@ class GroupTrackMotionModelBase(nn.Module):
 
     def forward(self, past_state, inputs, static_f):
         """前向传播"""
-        n_inputs = inputs.size(-1)
-        input_clamped = torch.clamp(inputs, -10, 10)
 
         next_state = self.solver(
-            self.model_update, past_state, input_clamped, static_f, self.dt
+            self.model_update, past_state, inputs, static_f, self.dt
         )
-        return next_state, input_clamped
+        return next_state, inputs
 
     def state_transition_matrix(self, X, inp, static_f):
         """计算状态转移矩阵 (用于雅可比)"""
@@ -150,72 +169,13 @@ class GroupTrackFullModel(GroupTrackMotionModelBase):
     """完整的群跟踪模型 (包含结构加速度和机动补偿)"""
 
     def model_update(self, X, u, static_f):
-        inputs = self._extract_inputs(u)
-        inp = torch.cat((X, inputs['u_x']), dim=-1)
+        feature_fusion = self._extract_inputs(u)
+        inp = torch.cat((self.x_embeding(X).squeeze(), feature_fusion), dim=-1)
 
         acc = self.backbone(inp)
 
-        dvx = (acc[..., 0].unsqueeze(-1) +
-                inputs['u_acc'][..., 0].unsqueeze(-1) +
-                inputs['u_struct_acc'][..., 0].unsqueeze(-1))
-        dvy = (acc[..., 1].unsqueeze(-1) +
-                inputs['u_acc'][..., 1].unsqueeze(-1) +
-                inputs['u_struct_acc'][..., 1].unsqueeze(-1))
-
-        dxdt = self._compute_dxdt(X)
-        dX = torch.cat((dxdt, dvx, dvy), dim=-1)
-        return dX
-
-
-class GroupTrackWithoutStruct(GroupTrackMotionModelBase):
-    """不包含结构加速度的群跟踪模型"""
-
-    def model_update(self, X, u, static_f):
-        inputs = self._extract_inputs(u)
-        # 不使用结构加速度
-        inp = torch.cat((X, inputs['u_x']), dim=-1)
-
-        acc = self.backbone(inp)
-
-        dvx = acc[..., 0].unsqueeze(-1) + inputs['u_acc'][..., 0].unsqueeze(-1)
-        dvy = acc[..., 1].unsqueeze(-1) + inputs['u_acc'][..., 1].unsqueeze(-1)
-
-        dxdt = self._compute_dxdt(X)
-        dX = torch.cat((dxdt, dvx, dvy), dim=-1)
-        return dX
-
-
-class GroupTrackWithoutGASF(GroupTrackMotionModelBase):
-    """不包含机动补偿单元的群跟踪模型"""
-
-    def model_update(self, X, u, static_f):
-        inputs = self._extract_inputs(u)
-        # 不使用机动补偿加速度
-        inp = torch.cat((X, inputs['u_x']), dim=-1)
-
-        acc = self.backbone(inp)
-
-        dvx = (acc[..., 0].unsqueeze(-1) +
-                inputs['u_struct_acc'][..., 0].unsqueeze(-1))
-        dvy = (acc[..., 1].unsqueeze(-1) +
-                inputs['u_struct_acc'][..., 1].unsqueeze(-1))
-
-        dxdt = self._compute_dxdt(X)
-        dX = torch.cat((dxdt, dvx, dvy), dim=-1)
-        return dX
-
-
-class GroupTrackWithoutStructGASF(GroupTrackMotionModelBase):
-    """只包含基本模型的群跟踪模型 (无结构和机动补偿)"""
-
-    def model_update(self, X, u, static_f):
-        # 只使用基础输入
-        inp = torch.cat((X, u), dim=-1)
-
-        acc = self.backbone(inp)
-
-        dvx = acc[..., 0].unsqueeze(-1)
-        dvy = acc[..., 1].unsqueeze(-1)
+        dvx = acc[..., 0:1].unsqueeze(-1)
+        dvy = acc[..., 1:2].unsqueeze(-1)
 
         dxdt = self._compute_dxdt(X)
         dX = torch.cat((dxdt, dvx, dvy), dim=-1)
@@ -224,6 +184,4 @@ class GroupTrackWithoutStructGASF(GroupTrackMotionModelBase):
 
 # 向后兼容的别名
 SecondOrderNeuralODE_groupTrack = GroupTrackFullModel
-SecondOrderNeuralODE_groupTrack_without_struct = GroupTrackWithoutStruct
-SecondOrderNeuralODE_groupTrack_without_GASF = GroupTrackWithoutGASF
-SecondOrderNeuralODE_groupTrack_without_struct_GASF = GroupTrackWithoutStructGASF
+

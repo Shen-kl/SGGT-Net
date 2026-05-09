@@ -387,8 +387,8 @@ class Trainer:
             )
 
             # 计算损失
-            all_states_prediction, all_Ps_prediction, mixture_coeffs, target = outputs[:4]
-            loss = self.wta_loss(all_states_prediction, target, outputs[3])
+            loss, _, _ ,_ = self.compute_loss(outputs, graph_data, time_step)
+            batch_metrics['loss'].append(loss.item())
 
             # 计算指标
             evaluation_metrics, x_update_renorm = self.compute_evaluation_metrics(

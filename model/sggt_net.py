@@ -23,7 +23,7 @@ class SGGT_Net(nn.Module):
                  encoder_use_edge_features, decoder_motion_model, decoder_max_length, decoder_hidden_size,
                  decoder_n_heads, decoder_n_layers, decoder_alpha, decoder_dropout, decoder_residual_length,
                  decoder_z_dimension,
-                 decoder_gnn_layer, decoder_use_GASF, decoder_use_struct, delta_T):
+                 decoder_gnn_layer, decoder_use_GASF, decoder_use_SEAN, delta_T):
         super().__init__()
         self.encoder = GRUGNNEncoder(encoder_input_size, encoder_hidden_size, encoder_n_heads, encoder_n_layers,
                                      encoder_n_mixtures, encoder_dropout, encoder_gnn_layer,
@@ -31,7 +31,7 @@ class SGGT_Net(nn.Module):
         self.decoder = GRUGNNDecoder(decoder_motion_model, delta_T, decoder_max_length, decoder_hidden_size,
                                      decoder_n_heads, decoder_n_layers, decoder_alpha, decoder_dropout,
                                      decoder_residual_length, decoder_z_dimension,
-                                     decoder_gnn_layer, decoder_use_GASF, decoder_use_struct)
+                                     decoder_gnn_layer, decoder_use_GASF, decoder_use_SEAN)
 
         # 扩展卡尔曼滤波器
         self.ekf_filter = ExtendedKalmanFilter(delta_T)
