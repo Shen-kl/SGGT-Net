@@ -52,6 +52,7 @@ class Trainer:
         self.logger = logger
         self.config = config
         self.args = args
+        self.device = torch.device(args.device)
 
         # 初始化损失函数
         self.wta_loss = EWTALoss()
@@ -127,7 +128,7 @@ class Trainer:
             P_predict: 初始化的状态协方差
         """
         return GraphDataProcessor.init_covariance_from_measurement(
-            measureNoiseCov, self.args.T, self.config
+            measureNoiseCov, self.args.T, self.config, device=measureNoiseCov.device
         )
 
     def compute_loss(self, outputs, graph_data, time_step, previous_adjacency=None,
@@ -230,13 +231,17 @@ class Trainer:
 
         with tqdm(total=len(train_dataloader), desc=f'Train {current_epoch}/{self.train_epoches}') as pbar:
             for batch_idx, graph_data in enumerate(train_dataloader):
+                # 计算噪声协方差
+                measureNoiseCov, measureNoiseCov_norm = self.compute_measurement_noise(graph_data)
+                graph_data = graph_data.to(self.device, non_blocking=True)
+                measureNoiseCov = measureNoiseCov.to(self.device, non_blocking=True)
+                measureNoiseCov_norm = measureNoiseCov_norm.to(self.device, non_blocking=True)
+
                 # 初始化窗口
                 graph_data_tmp = GraphDataProcessor.init_input_window(
                     graph_data, self.config, self.args
                 )
                 graph_data_norm = graph_data_tmp.clone()  # 准备归一化版本
-                # 计算噪声协方差
-                measureNoiseCov, measureNoiseCov_norm = self.compute_measurement_noise(graph_data)
                 P_predict = self.init_state_covariance(measureNoiseCov)
 
                 # 训练循环
@@ -382,13 +387,17 @@ class Trainer:
         with torch.no_grad():
             with tqdm(total=len(val_dataloader), desc=f'Val {current_epoch}/{self.train_epoches}') as pbar:
                 for graph_data in val_dataloader:
+                    # 计算噪声协方差
+                    measureNoiseCov, measureNoiseCov_norm = self.compute_measurement_noise(graph_data)
+                    graph_data = graph_data.to(self.device, non_blocking=True)
+                    measureNoiseCov = measureNoiseCov.to(self.device, non_blocking=True)
+                    measureNoiseCov_norm = measureNoiseCov_norm.to(self.device, non_blocking=True)
+
                     # 初始化窗口
                     graph_data_tmp = GraphDataProcessor.init_input_window(
                         graph_data, self.config, self.args
                     )
                     graph_data_norm = graph_data_tmp.clone()  # 准备归一化版本
-                    # 计算噪声协方差
-                    measureNoiseCov, measureNoiseCov_norm = self.compute_measurement_noise(graph_data)
                     P_predict = self.init_state_covariance(measureNoiseCov)
 
                     # 验证循环

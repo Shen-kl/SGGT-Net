@@ -79,6 +79,7 @@ if __name__ == '__main__':
 
 
 
+    track_model = track_model.to(args.device)
     track_model_optimizer = torch.optim.Adam(track_model.parameters(), lr=args.lr)
 
     track_model_lr_schedule = torch.optim.lr_scheduler.ReduceLROnPlateau(track_model_optimizer,
