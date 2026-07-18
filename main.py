@@ -73,7 +73,9 @@ if __name__ == '__main__':
                                  args.decoder_n_heads, args.decoder_n_layers, args.decoder_alpha,
                                  args.decoder_dropout, args.decoder_residual_length,
                                  args.decoder_z_dimension, args.decoder_gnn_layer,
-                                 args.decoder_use_GASF, args.decoder_use_SEAN, args.T)
+                                 args.decoder_use_GASF, args.decoder_use_SEAN, args.T,
+                                 model_variant=args.model_variant,
+                                 covariance_transition=args.covariance_transition)
 
 
 

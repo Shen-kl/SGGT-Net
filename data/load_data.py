@@ -14,7 +14,7 @@ class GroupTargetTrackingDataset_load_whole_trajectory(Dataset):
         self.dataset_path = dataset_path
         self.mode = mode
         self.dataset_len = 0
-        data_list = os.listdir(f'{self.dataset_path}{self.mode}/target')
+        data_list = os.listdir(os.path.join(self.dataset_path, self.mode, 'target'))
 
         for name in data_list:
             self.dataset_len = self.dataset_len + 1

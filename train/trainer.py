@@ -130,7 +130,8 @@ class Trainer:
             measureNoiseCov, self.args.T, self.config
         )
 
-    def compute_loss(self, outputs, graph_data, time_step, use_wta_loss=True):
+    def compute_loss(self, outputs, graph_data, time_step, previous_adjacency=None,
+                     previous_adjacency_mask=None, use_wta_loss=True):
         """
         计算训练损失
 
@@ -164,17 +165,60 @@ class Trainer:
 
         # 结构损失
         # 计算 分类损失
-        if time_step < graph_data.param_change_time[0, -2]:
-            use_struct_loss_flag = (torch.rand(1) < 0.2)
-        else:
-            use_struct_loss_flag = (torch.rand(1) < 1)
-        if use_struct_loss_flag:
-            loss_struct = focal_loss(A_vec, graph_data.struct_feat[time_step], all_A_vec_mask)
-        else:
-            loss_struct = 0
+        zero = loss_predict.new_zeros(())
+        loss_struct = zero
+        if A_vec.numel() > 0:
+            struct_target = graph_data.struct_feat[time_step].to(A_vec).reshape(-1)
+            if struct_target.numel() == A_vec.size(0):
+                struct_target = struct_target.view(-1, 1).expand_as(A_vec)
+                loss_struct = focal_loss(
+                    A_vec.clamp(1e-6, 1 - 1e-6), struct_target, all_A_vec_mask
+                )
 
-        loss = loss_predict + loss_update + loss_struct
+        loss_temporal = zero
+        if previous_adjacency is not None and previous_adjacency.shape == A_vec.shape:
+            temporal_mask = all_A_vec_mask & previous_adjacency_mask
+            if temporal_mask.any():
+                loss_temporal = torch.nn.functional.smooth_l1_loss(
+                    A_vec[temporal_mask], previous_adjacency[temporal_mask]
+                )
 
+        loss_aux = zero
+        if outputs.auxiliary_delta_v.numel() > 0 and getattr(self.model.decoder, 'use_GASF', False):
+            # Raw dataset order is [x, vx, y, vy]; convert the one-step
+            # velocity increment to the normalized internal coordinates.
+            velocity_delta = (
+                graph_data.y[:, time_step:time_step + 1, [1, 3]]
+                - graph_data.x[:, time_step - 1:time_step, [1, 3]]
+            ).to(outputs.auxiliary_delta_v) / self.config['S_VEL']
+            maneuver_weight = 1.0 + velocity_delta.norm(dim=-1).clamp(max=4.0)
+            auxiliary_error = torch.nn.functional.smooth_l1_loss(
+                outputs.auxiliary_delta_v, velocity_delta, reduction='none'
+            ).mean(dim=-1)
+            loss_aux = (
+                auxiliary_error * maneuver_weight * dec_mask
+            ).sum() / dec_mask.sum().clamp_min(1.0)
+
+        loss_nll = zero
+        if outputs.covariances.numel() > 0:
+            difference = (outputs.target.unsqueeze(2) - outputs.states).unsqueeze(-1)
+            covariance = outputs.covariances
+            eye = torch.eye(covariance.size(-1), device=covariance.device)
+            covariance = covariance + 1e-5 * eye
+            solution = torch.linalg.solve(covariance, difference)
+            mahalanobis = (difference.transpose(-1, -2) @ solution).squeeze(-1).squeeze(-1)
+            logdet = torch.linalg.slogdet(covariance).logabsdet
+            best_nll = (0.5 * (mahalanobis + logdet)).min(dim=2).values
+            best_nll = best_nll.clamp(min=-20.0, max=100.0)
+            loss_nll = (best_nll * dec_mask).sum() / dec_mask.sum().clamp_min(1.0)
+
+        loss = (
+            loss_predict + loss_update
+            + getattr(self.args, 'lambda_struct', 0.5) * loss_struct
+            + getattr(self.args, 'lambda_temporal', 0.05) * loss_temporal
+            + getattr(self.args, 'lambda_aux', 0.1) * loss_aux
+            + getattr(self.args, 'lambda_nll', 0.05) * loss_nll
+        )
         return loss, loss_predict, loss_update, loss_struct
 
     def train_epoch(self, train_dataloader, current_epoch):
@@ -238,6 +282,8 @@ class Trainer:
 
         # 滑动窗口训练
         P_predict_init = P_predict.clone()
+        previous_adjacency = None
+        previous_adjacency_mask = None
         for time_step in range(self.config['input_graph_window_len'],
                            time_total - self.config['output_graph_window_len']):
             # 归一化数据
@@ -251,7 +297,12 @@ class Trainer:
             )
 
             # 计算损失
-            loss, _, _ ,_ = self.compute_loss(outputs, graph_data, time_step)
+            loss, _, _ ,_ = self.compute_loss(
+                outputs, graph_data, time_step,
+                previous_adjacency, previous_adjacency_mask
+            )
+            previous_adjacency = outputs.adjacency.detach()
+            previous_adjacency_mask = outputs.adjacency_mask.detach()
             batch_metrics['loss'].append(loss.item())
 
             # 反向传播
@@ -307,7 +358,12 @@ class Trainer:
 
         # 计算 F1 分数
         from utils.losses import edge_f1_score
-        f1_struct, _, _ = edge_f1_score(A_vec.detach(), graph_data_tmp.struct_feat[0])
+        if A_vec.numel() == 0:
+            f1_struct = 0.0
+        else:
+            target = graph_data_tmp.struct_feat[0].to(A_vec).reshape(-1)
+            prediction = A_vec.detach().reshape(A_vec.size(0), -1)[:, 0]
+            f1_struct, _, _ = edge_f1_score(prediction, target)
 
         return {
             'location_rmse_prediction': location_rmse_prediction,
@@ -374,6 +430,8 @@ class Trainer:
         }
 
         # 滑动窗口验证
+        previous_adjacency = None
+        previous_adjacency_mask = None
         for time_step in range(self.config['input_graph_window_len'],
                            time_total - self.config['output_graph_window_len']):
             # 归一化数据
@@ -387,7 +445,12 @@ class Trainer:
             )
 
             # 计算损失
-            loss, _, _ ,_ = self.compute_loss(outputs, graph_data, time_step)
+            loss, _, _ ,_ = self.compute_loss(
+                outputs, graph_data, time_step,
+                previous_adjacency, previous_adjacency_mask
+            )
+            previous_adjacency = outputs.adjacency.detach()
+            previous_adjacency_mask = outputs.adjacency_mask.detach()
             batch_metrics['loss'].append(loss.item())
 
             # 计算指标
@@ -445,7 +508,11 @@ class Trainer:
                 'loss': val_metrics.get('loss', 0),
                 'lr_schedule': self.lr_schedule.state_dict(),
                 'epoch': current_epoch,
-                'metrics': val_metrics
+                'metrics': val_metrics,
+                'model_variant': getattr(self.model, 'model_variant', 'sggt_v1'),
+                'covariance_transition': getattr(self.model, 'covariance_transition', 'cv'),
+                'use_SEAN': getattr(self.model.decoder, 'use_SEAN', False),
+                'use_GASF': getattr(self.model.decoder, 'use_GASF', False),
             }, str(checkpoint_path))
 
             self.best_model_path = checkpoint_path

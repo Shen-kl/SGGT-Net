@@ -82,7 +82,7 @@ class Args:
         parser.add_argument('--test_epochs', default=10, type=int,
                             help='Max training epoch')
         parser.add_argument('--eval_batch_size', default=1, type=int)
-        parser.add_argument('--optimizer_factor', default=0.8, type=int)
+        parser.add_argument('--optimizer_factor', default=0.8, type=float)
         parser.add_argument('--optimizer_patience', default=5, type=int)
         parser.add_argument('--lr', default=1e-3, type=float,
                             help='learning rate')
@@ -106,30 +106,41 @@ class Args:
         parser.add_argument('--n-ode-layers', type=int, default=3,
                             help='n ode layers (default: 1)') # residula: 3
 
-        parser.add_argument('--encoder_input_size', default=4, type=float)
-        parser.add_argument('--encoder_hidden_size', default=64, type=float)
-        parser.add_argument('--encoder_n_heads', default=3, type=float,)
-        parser.add_argument('--encoder_n_layers', default=2, type=float,)
+        parser.add_argument('--encoder_input_size', default=4, type=int)
+        parser.add_argument('--encoder_hidden_size', default=64, type=int)
+        parser.add_argument('--encoder_n_heads', default=3, type=int,)
+        parser.add_argument('--encoder_n_layers', default=2, type=int,)
         parser.add_argument('--encoder_n_mixtures', default=4, type=int)
         parser.add_argument('--encoder_dropout', default=0.1, type=float)
         parser.add_argument('--encoder_gnn_layer', default="graphconv", type=str)
-        parser.add_argument('--encoder_use_edge_features', default=True, type=bool)
+        parser.add_argument('--encoder_use_edge_features', default=True,
+                            action=argparse.BooleanOptionalAction)
 
 
         parser.add_argument('--decoder_motion_model', default='neuralode', type=str)
-        parser.add_argument('--decoder_max_length', default=9, type=float) # 输入历史帧的长度加1
-        parser.add_argument('--decoder_hidden_size', default=64, type=float,
+        parser.add_argument('--decoder_max_length', default=9, type=int) # 输入历史帧的长度加1
+        parser.add_argument('--decoder_hidden_size', default=64, type=int,
                             help='(default: 64)')
-        parser.add_argument('--decoder_n_heads', default=3, type=float)
+        parser.add_argument('--decoder_n_heads', default=3, type=int)
         parser.add_argument('--decoder_n_layers', default=2, type=int)
         parser.add_argument('--decoder_alpha', default=0.2, type=float)  #
         parser.add_argument('--decoder_dropout', default=0.1, type=float)  #
         parser.add_argument('--decoder_gnn_layer', default="graphconv", type=str)  #
-        parser.add_argument('--decoder_residual_length', default=[8,16], type=list)  #
-        parser.add_argument('--decoder_z_dimension', default=2, type=float)  #
+        parser.add_argument('--decoder_residual_length', default=[8, 16], nargs='+', type=int)  #
+        parser.add_argument('--decoder_z_dimension', default=2, type=int)  #
         parser.add_argument('--decoder_node_num', default=200, type=int) # 允许跟踪的最大目标数量
-        parser.add_argument('--decoder_use_GASF', default=True, type=bool)
-        parser.add_argument('--decoder_use_SEAN', default=True, type=bool)
+        parser.add_argument('--decoder_use_GASF', default=True,
+                            action=argparse.BooleanOptionalAction)
+        parser.add_argument('--decoder_use_SEAN', default=True,
+                            action=argparse.BooleanOptionalAction)
+        parser.add_argument('--model_variant', default='sggt_v2',
+                            choices=['sggt_v1', 'sggt_v2'])
+        parser.add_argument('--covariance_transition', default='ode_jacobian',
+                            choices=['ode_jacobian', 'cv'])
+        parser.add_argument('--lambda_struct', default=0.5, type=float)
+        parser.add_argument('--lambda_temporal', default=0.05, type=float)
+        parser.add_argument('--lambda_aux', default=0.1, type=float)
+        parser.add_argument('--lambda_nll', default=0.05, type=float)
 
 
         parser.add_argument('--neural_net', default='sggt_net', type=str)  # baseline/ sggt_net/  MCST

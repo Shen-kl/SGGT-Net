@@ -16,6 +16,12 @@ from torch_geometric.utils import unbatch, unbatch_edge_index
 from model.AttentionMechanism import *
 from matplotlib import pyplot as plt
 import pickle
+from typing import NamedTuple
+
+from model.sggt_v2_modules import (
+    JointGraphTemporalSpectralFilter,
+    TemporalProbabilisticSEAN,
+)
 
 '''
  改进encoder-decoder 增加残差补偿模块 改进SDE
@@ -443,6 +449,221 @@ class GRUGNNDecoder(nn.Module):
         next_state, model_input = self.motion_model(past_state, model_input, static_f=None)
 
         return next_state, model_input, process_noise, hidden, A_vec, A_vec_mask_output, total_group_num, gate_final
+
+    def get_initial_state(self, last_enc_state, data):
+        return last_enc_state
+
+
+class DecoderV2Output(NamedTuple):
+    next_state: torch.Tensor
+    model_input: dict
+    process_noise: torch.Tensor
+    hidden: torch.Tensor
+    adjacency_vector: torch.Tensor
+    adjacency_mask: torch.Tensor
+    group_count: int
+    spectral_weights: torch.Tensor
+    node_entropy: torch.Tensor
+    auxiliary_delta_v: torch.Tensor
+    film_gate: torch.Tensor
+
+
+class GRUGNNDecoderV2(nn.Module):
+    """Decoder with temporal structure inference and joint graph-time GASF."""
+
+    def __init__(
+        self,
+        motion_model,
+        delta_T,
+        max_length=10,
+        hidden_size=64,
+        n_heads=3,
+        n_layers=1,
+        alpha=0.2,
+        dropout=0.1,
+        residual_length=(8, 16),
+        z_dimension=2,
+        gnn_layer="graphconv",
+        use_GASF=True,
+        use_SEAN=True,
+    ):
+        super().__init__()
+        self.gru_cell = GRUGNNCell(
+            hidden_size,
+            hidden_size,
+            n_heads,
+            n_layers,
+            dropout,
+            gnn_layer,
+            edge_dim=1,
+        )
+        self.alpha = alpha
+        self.use_GASF = bool(use_GASF)
+        self.use_SEAN = bool(use_SEAN)
+        self.motion_model = motion_model
+        self.input_size = motion_model.n_states
+        self.output_size = z_dimension
+        self.mixtures = motion_model.mixtures
+        self.hidden_size = hidden_size
+        self.dropout = nn.Dropout(p=dropout)
+
+        self.attn_combine = nn.Linear(hidden_size, hidden_size)
+        self.generator = nn.Linear(hidden_size, hidden_size * 4)
+        self.sig_1 = nn.Linear(hidden_size, int(self.mixtures))
+        self.sig_2 = nn.Linear(hidden_size, int(self.mixtures))
+        self.rho = nn.Linear(hidden_size, int(self.mixtures))
+        self.edge_projector = EdgeProjector()
+        self.attention = AdditiveAttention(
+            int(hidden_size), int(hidden_size), int(hidden_size * 2), dropout=dropout
+        )
+        self.time_decay = nn.Parameter(torch.tensor(0.1))
+        self.linear_2 = nn.Linear(hidden_size * 2, hidden_size)
+        self.Q_scaler = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, 1),
+            nn.Sigmoid(),
+        )
+
+        if self.use_SEAN:
+            self.SEAN = TemporalProbabilisticSEAN(hidden_size, hidden_size)
+        else:
+            self.SEAN = None
+        if self.use_GASF:
+            self.GASF = JointGraphTemporalSpectralFilter(
+                hidden_size,
+                windows=tuple(int(value) for value in residual_length),
+                signal_dim=z_dimension,
+                chebyshev_order=2,
+            )
+        else:
+            self.GASF = None
+
+    def process_noise_matrix(self, x1, x2, x3, batch_size, scale_features):
+        sig1 = F.softplus(self.sig_1(x1))
+        sig2 = F.softplus(self.sig_2(x2))
+        rho = F.softsign(self.rho(x3))
+        q_t = torch.zeros(
+            batch_size,
+            int(self.mixtures),
+            self.output_size,
+            self.output_size,
+            device=x1.device,
+        )
+        q_t[..., 0, 0] = sig1.square()
+        q_t[..., 1, 1] = sig2.square()
+        q_t[..., 0, 1] = q_t[..., 1, 0] = sig1 * sig2 * rho
+        noise_scale = self.Q_scaler(scale_features).unsqueeze(1).unsqueeze(1)
+        return noise_scale * q_t
+
+    def forward(self, data):
+        (
+            x,
+            hidden,
+            encoder_out,
+            edge_index,
+            edge_feature,
+            past_state,
+            batch,
+            nan_mask,
+            residual,
+        ) = data
+        batch_size = x.size(0)
+
+        time_steps = encoder_out.shape[1]
+        time = torch.arange(
+            time_steps, device=encoder_out.device, dtype=encoder_out.dtype
+        )
+        decay = torch.sigmoid(self.time_decay)
+        time_feature = torch.exp(-decay * (time_steps - 1 - time)).view(1, time_steps, 1)
+        attention_input = self.linear_2(
+            torch.cat(
+                [
+                    encoder_out,
+                    time_feature.expand(encoder_out.size(0), -1, encoder_out.size(-1)),
+                ],
+                dim=-1,
+            )
+        )
+        attended = self.attention(
+            attention_input, attention_input, attention_input[:, -1, :].unsqueeze(1)
+        )
+        output = F.leaky_relu(self.attn_combine(attended[:, 0]), self.alpha)
+        projected_edge = self.edge_projector(edge_feature.to(torch.float32))
+        hidden = self.gru_cell(
+            output, edge_index, hidden, edge_attr=projected_edge
+        )
+
+        valid_nodes = nan_mask.reshape(nan_mask.size(0), -1).all(dim=-1, keepdim=True)
+        if self.use_SEAN:
+            structure = self.SEAN(batch, past_state, hidden, valid_nodes)
+            structural_features = structure.structural_features
+            learned_edge_index = structure.edge_index
+            learned_edge_weight = structure.edge_weight
+            node_entropy = structure.node_entropy
+            adjacency_vector = structure.adjacency_vector
+            adjacency_mask = structure.vector_mask
+            group_count = structure.group_count
+        else:
+            structural_features = torch.zeros_like(hidden)
+            learned_edge_index = edge_index
+            learned_edge_weight = projected_edge
+            node_entropy = torch.ones(batch_size, 1, device=hidden.device)
+            adjacency_vector = hidden.new_empty(0)
+            adjacency_mask = torch.empty(0, dtype=torch.bool, device=hidden.device)
+            group_count = 0
+
+        if self.use_GASF:
+            spectral = self.GASF(
+                residual,
+                learned_edge_index,
+                learned_edge_weight,
+                node_entropy,
+                nan_mask,
+            )
+            gasf_features = spectral.latent
+            gasf_confidence = spectral.confidence
+            spectral_weights = spectral.scale_weights
+        else:
+            gasf_features = torch.zeros_like(hidden)
+            gasf_confidence = torch.zeros(batch_size, 1, device=hidden.device)
+            spectral_weights = torch.zeros(batch_size, 0, device=hidden.device)
+
+        generated = self.dropout(
+            F.leaky_relu(
+                self.generator(F.leaky_relu(hidden, self.alpha)), self.alpha
+            )
+        )
+        x1, x2, x3, x4 = torch.split(generated, self.hidden_size, dim=-1)
+        scale_features = structural_features if self.use_SEAN else hidden
+        process_noise = self.process_noise_matrix(
+            x1, x2, x3, batch_size, scale_features
+        )
+
+        model_input = {'gnn_model_output': x4}
+        if self.use_SEAN:
+            model_input['struct_feats'] = structural_features
+        if self.use_GASF:
+            model_input['GASF_output_fusion'] = gasf_features
+            model_input['GASF_confidence'] = gasf_confidence
+
+        next_state, model_input = self.motion_model(
+            past_state, model_input, static_f=None
+        )
+        return DecoderV2Output(
+            next_state,
+            model_input,
+            process_noise,
+            hidden,
+            adjacency_vector,
+            adjacency_mask,
+            group_count,
+            spectral_weights,
+            node_entropy,
+            model_input['auxiliary_delta_v'],
+            model_input['film_gate'],
+        )
 
     def get_initial_state(self, last_enc_state, data):
         return last_enc_state

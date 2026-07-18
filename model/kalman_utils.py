@@ -119,7 +119,7 @@ class ExtendedKalmanFilter:
         self.delta_T = delta_T
         self.H = MatrixBuilder.build_observation_matrix()
 
-    def time_update(self, P_t, G_t, q_t, device=None):
+    def time_update(self, P_t, G_t, q_t, device=None, F_t=None):
         """
         时间更新步骤
 
@@ -135,11 +135,13 @@ class ExtendedKalmanFilter:
         """
         batch_size = P_t.shape[0]
 
-        # 构建状态转移矩阵
+        # The learned flow Jacobian is already expressed in normalized state
+        # coordinates.  V1 callers retain the scaled constant-velocity fallback.
         D = MatrixBuilder.build_scaling_matrix(device)
         D_inv = torch.inverse(D)
-        F_cv = MatrixBuilder.build_cv_transition_matrix(self.delta_T, batch_size, device)
-        F_t = D_inv @ F_cv @ D
+        if F_t is None:
+            F_cv = MatrixBuilder.build_cv_transition_matrix(self.delta_T, batch_size, device)
+            F_t = D_inv @ F_cv @ D
 
         # 计算过程噪声
         Q_t = D_inv @ G_t @ q_t @ G_t.transpose(-1, -2) @ D_inv.transpose(-1, -2)
