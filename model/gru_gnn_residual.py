@@ -539,7 +539,7 @@ class GRUGNNDecoderV2(nn.Module):
         adaptive_q_tail_threshold=0.8,
         innovation_decomposition=False,
         innovation_whiten_clip=20.0,
-        gasf_recurrent_filter=True,
+        gasf_recurrent_filter=False,
         gasf_recurrent_gate_initial_update=0.1,
     ):
         super().__init__()

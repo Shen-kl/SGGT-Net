@@ -364,8 +364,6 @@ class SGGTModulesTest(unittest.TestCase):
             recurrent_filter=True,
         ).eval()
         with torch.no_grad():
-            for parameter in module.parameter_context_networks[0].parameters():
-                parameter.zero_()
             for parameter in module.parameter_update_gates[0].parameters():
                 parameter.zero_()
             # Make the feed-forward candidate observably depend on the current
@@ -419,7 +417,7 @@ class SGGTModulesTest(unittest.TestCase):
             0.0,
         )
 
-    def test_previous_eta_and_abc_both_receive_recurrent_parameter_gradients(self):
+    def test_previous_abc_recursion_receives_gate_and_candidate_gradients(self):
         module = JointGraphTemporalSpectralFilter(
             hidden_dim=8,
             windows=(8,),
@@ -428,7 +426,6 @@ class SGGTModulesTest(unittest.TestCase):
         ).train()
         nodes = 3
         previous_state = SpectralFilterState(
-            torch.randn(nodes, 1, 8),
             torch.tensor([-0.5, -0.75, 0.25]).view(1, 1, 3).repeat(
                 nodes, 1, 1
             ),
@@ -442,9 +439,9 @@ class SGGTModulesTest(unittest.TestCase):
             recurrent_state=previous_state,
         )
         output.recurrent_state.filter_parameters.sum().backward()
-        context_gradient = sum(
+        candidate_gradient = sum(
             float(parameter.grad.abs().sum())
-            for parameter in module.parameter_context_networks.parameters()
+            for parameter in module.frequency_filters.parameters()
             if parameter.grad is not None
         )
         gate_gradient = sum(
@@ -452,8 +449,90 @@ class SGGTModulesTest(unittest.TestCase):
             for parameter in module.parameter_update_gates.parameters()
             if parameter.grad is not None
         )
-        self.assertGreater(context_gradient, 0.0)
+        self.assertGreater(candidate_gradient, 0.0)
         self.assertGreater(gate_gradient, 0.0)
+        self.assertEqual(
+            output.recurrent_state._fields, ("filter_parameters", "valid")
+        )
+
+    def test_disabled_abc_recursion_is_exactly_state_independent(self):
+        module = JointGraphTemporalSpectralFilter(
+            hidden_dim=8,
+            windows=(8,),
+            graph_mode="temporal_only",
+            recurrent_filter=False,
+        ).eval()
+        nodes = 3
+        residual = torch.randn(nodes, 8, 2)
+        valid = torch.ones(nodes, 8, 1, dtype=torch.bool)
+        previous_state = SpectralFilterState(
+            torch.randn(nodes, 1, 3),
+            torch.ones(nodes, 1, 1, dtype=torch.bool),
+        )
+        empty_edges = torch.empty(2, 0, dtype=torch.long)
+        empty_weights = torch.empty(0)
+        fresh = module(
+            residual, empty_edges, empty_weights, valid_mask=valid
+        )
+        with_state = module(
+            residual,
+            empty_edges,
+            empty_weights,
+            valid_mask=valid,
+            recurrent_state=previous_state,
+        )
+        torch.testing.assert_close(with_state.latent, fresh.latent, rtol=0, atol=0)
+        torch.testing.assert_close(
+            with_state.recurrent_state.filter_parameters,
+            fresh.recurrent_state.filter_parameters,
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            with_state.parameter_update_gates,
+            torch.ones_like(with_state.parameter_update_gates),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_recurrent_alpha_one_exactly_recovers_feedforward_filter(self):
+        module = JointGraphTemporalSpectralFilter(
+            hidden_dim=8,
+            windows=(8,),
+            graph_mode="temporal_only",
+            recurrent_filter=True,
+        ).eval()
+        nodes = 3
+        valid = torch.ones(nodes, 8, 1, dtype=torch.bool)
+        empty_edges = torch.empty(2, 0, dtype=torch.long)
+        empty_weights = torch.empty(0)
+        previous = module(
+            torch.randn(nodes, 8, 2),
+            empty_edges,
+            empty_weights,
+            valid_mask=valid,
+        )
+        current_residual = torch.randn(nodes, 8, 2)
+        module.recurrent_filter = False
+        feedforward = module(
+            current_residual, empty_edges, empty_weights, valid_mask=valid
+        )
+        module.recurrent_filter = True
+        module.parameter_update_gate_override = 1.0
+        recurrent = module(
+            current_residual,
+            empty_edges,
+            empty_weights,
+            valid_mask=valid,
+            recurrent_state=previous.recurrent_state,
+        )
+        torch.testing.assert_close(recurrent.latent, feedforward.latent, rtol=0, atol=0)
+        torch.testing.assert_close(
+            recurrent.recurrent_state.filter_parameters,
+            feedforward.recurrent_state.filter_parameters,
+            rtol=0,
+            atol=0,
+        )
 
     def test_recurrent_abc_state_resets_for_invalid_and_reborn_nodes(self):
         module = JointGraphTemporalSpectralFilter(
@@ -479,10 +558,6 @@ class SGGTModulesTest(unittest.TestCase):
             recurrent_valid_mask=torch.zeros(nodes, 1, dtype=torch.bool),
         )
         self.assertFalse(bool(invalid.recurrent_state.valid.any()))
-        self.assertTrue(torch.equal(
-            invalid.recurrent_state.scale_latents,
-            torch.zeros_like(invalid.recurrent_state.scale_latents),
-        ))
         self.assertTrue(torch.equal(
             invalid.recurrent_state.filter_parameters,
             torch.zeros_like(invalid.recurrent_state.filter_parameters),

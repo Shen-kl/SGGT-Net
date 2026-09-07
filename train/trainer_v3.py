@@ -28,9 +28,21 @@ class Trainer:
         self.device = torch.device(args.device)
         self.train_epoches = int(getattr(args, "train_epochs", 100))
         self.P_change_epochs = int(getattr(args, "covariance_reset_epochs", 0))
-        self.tf_prob_start = 1.0
-        self.tf_prob_min = 0.0
-        self.tf_decay_epochs = 20
+        self.tf_prob_start = float(
+            getattr(args, "teacher_forcing_start", 1.0)
+        )
+        self.tf_prob_min = float(
+            getattr(args, "teacher_forcing_min", 0.0)
+        )
+        self.tf_decay_epochs = int(
+            getattr(args, "teacher_forcing_decay_epochs", 20)
+        )
+        if not 0.0 <= self.tf_prob_min <= self.tf_prob_start <= 1.0:
+            raise ValueError(
+                "teacher forcing requires 0 <= minimum <= start <= 1"
+            )
+        if self.tf_decay_epochs < 0:
+            raise ValueError("teacher forcing decay epochs must be non-negative")
         self.min_evaluation = float("inf")
         self.min_position_evaluation = float("inf")
         self.min_association_position_evaluation = float("inf")
@@ -40,9 +52,13 @@ class Trainer:
         self.best_model_path = None
 
     def get_tf_prob(self, current_epoch):
+        if self.tf_decay_epochs == 0:
+            return self.tf_prob_start
         return max(
             self.tf_prob_min,
-            self.tf_prob_start - current_epoch / self.tf_decay_epochs,
+            self.tf_prob_start
+            - (self.tf_prob_start - self.tf_prob_min)
+            * current_epoch / self.tf_decay_epochs,
         )
 
     def compute_measurement_noise(self, graph_data, frame_index=0):
@@ -1680,7 +1696,12 @@ class Trainer:
 
     def train_epoch(self, dataloader, current_epoch):
         self.model.train()
-        if getattr(self.args, "training_stage", "joint") == "q_adapt":
+        if getattr(self.args, "training_stage", "joint") == "filter_recurrence":
+            # Keep the converged Temporal model deterministic and identify
+            # only the scalar ABC update policy.
+            self.model.eval()
+            self.model.decoder.GASF.parameter_update_gates.train()
+        elif getattr(self.args, "training_stage", "joint") == "q_adapt":
             # Frozen dropout/normalization layers must be deterministic during
             # Q-only calibration; only the new adapter remains in train mode.
             self.model.eval()
@@ -1950,6 +1971,9 @@ class Trainer:
             "model_variant": getattr(self.model, "model_variant", "sggt_v1"),
             "covariance_transition": getattr(self.model, "covariance_transition", "cv"),
             "evaluation_protocol": getattr(self.args, "evaluation_protocol", None),
+            "teacher_forcing_start": self.tf_prob_start,
+            "teacher_forcing_min": self.tf_prob_min,
+            "teacher_forcing_decay_epochs": self.tf_decay_epochs,
             "interaction_physical_residual": bool(getattr(
                 self.args, "interaction_physical_residual", False
             )),
@@ -1972,7 +1996,7 @@ class Trainer:
                 self.args, "gasf_filter_mode", "abc"
             ),
             "gasf_recurrent_filter": getattr(
-                self.args, "gasf_recurrent_filter", True
+                self.args, "gasf_recurrent_filter", False
             ),
             "gasf_recurrent_gate_initial_update": getattr(
                 self.args, "gasf_recurrent_gate_initial_update", 0.1

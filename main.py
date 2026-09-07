@@ -284,6 +284,25 @@ if __name__ == '__main__':
             "Temporal GASF, encoder and ODE are frozen; online rollout uses "
             "the temporal comparator"
         )
+    elif args.training_stage == 'filter_recurrence':
+        if not args.decoder_use_GASF or not args.gasf_recurrent_filter:
+            raise ValueError(
+                "filter_recurrence requires GASF with recurrent ABC enabled"
+            )
+        for parameter in track_model.parameters():
+            parameter.requires_grad = False
+        for parameter in track_model.decoder.GASF.parameter_update_gates.parameters():
+            parameter.requires_grad = True
+        recurrent_parameter_count = sum(
+            parameter.numel() for parameter in track_model.parameters()
+            if parameter.requires_grad
+        )
+        if recurrent_parameter_count == 0:
+            raise RuntimeError("filter_recurrence has no trainable parameters")
+        print(
+            "ABC recurrence adaptation stage: "
+            f"{recurrent_parameter_count} trainable parameters"
+        )
     elif args.training_stage == 'q_adapt':
         if track_model.decoder.Q_innovation_encoder is None:
             raise ValueError("q_adapt requires --adaptive_q_mode innovation")
@@ -556,4 +575,3 @@ if __name__ == '__main__':
     training_entry = train_and_evaluation_v3 if is_v3_pack else train_and_evaluation
     training_entry(track_model, train_dataloader, test_dataloader, track_model_optimizer,
                    track_model_lr_schedule, logger, config, args)
-

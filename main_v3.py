@@ -257,11 +257,10 @@ if __name__ == '__main__':
              if args.causal_innovation_correction else ())
             + (('decoder.Q_innovation_encoder.',)
                if args.adaptive_q_mode != 'legacy' else ())
-            + ((
-                'decoder.GASF.recurrent_latent_norms.',
-                'decoder.GASF.parameter_context_networks.',
-                'decoder.GASF.parameter_update_gates.',
-            ) if args.gasf_recurrent_filter else ())
+            # The parameter-only recurrence heads are instantiated in both
+            # ablation arms so the common initialization and parameter count
+            # remain identical. Legacy Temporal checkpoints predate them.
+            + ('decoder.GASF.parameter_update_gates.',)
         )
         invalid_missing = [
             key for key in incompatible.missing_keys
@@ -285,7 +284,26 @@ if __name__ == '__main__':
         and args.fusion_adapt_epochs > 0
     )
     args.staged_joint_finetune = staged_joint_finetune
-    if args.training_stage == 'q_adapt':
+    if args.training_stage == 'filter_recurrence':
+        if not args.decoder_use_GASF or not args.gasf_recurrent_filter:
+            raise ValueError(
+                "filter_recurrence requires GASF with recurrent ABC enabled"
+            )
+        for parameter in track_model.parameters():
+            parameter.requires_grad = False
+        for parameter in track_model.decoder.GASF.parameter_update_gates.parameters():
+            parameter.requires_grad = True
+        recurrent_parameter_count = sum(
+            parameter.numel() for parameter in track_model.parameters()
+            if parameter.requires_grad
+        )
+        if recurrent_parameter_count == 0:
+            raise RuntimeError("filter_recurrence has no trainable parameters")
+        print(
+            "ABC recurrence adaptation stage: "
+            f"{recurrent_parameter_count} trainable parameters"
+        )
+    elif args.training_stage == 'q_adapt':
         if track_model.decoder.Q_innovation_encoder is None:
             raise ValueError("q_adapt requires --adaptive_q_mode innovation")
         for parameter in track_model.parameters():

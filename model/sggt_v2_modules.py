@@ -21,13 +21,11 @@ class StructureOutput(NamedTuple):
 class SpectralFilterState(NamedTuple):
     """Per-node, per-scale causal state for the recurrent ABC filter."""
 
-    scale_latents: torch.Tensor
     filter_parameters: torch.Tensor
     valid: torch.Tensor
 
     def detach(self):
         return SpectralFilterState(
-            self.scale_latents.detach(),
             self.filter_parameters.detach(),
             self.valid.detach(),
         )
@@ -43,6 +41,9 @@ class SpectralOutput(NamedTuple):
     structure: StructureOutput
     recurrent_state: SpectralFilterState
     parameter_update_gates: torch.Tensor
+    parameter_step_norms: torch.Tensor
+    filter_response_step_rms: torch.Tensor
+    recurrent_transition_valid: torch.Tensor
 
 
 def _upper_triangle(matrix: torch.Tensor) -> torch.Tensor:
@@ -330,7 +331,7 @@ class JointGraphTemporalSpectralFilter(nn.Module):
         interaction_activation_floor: float = 0.0,
         innovation_decomposition: bool = False,
         innovation_whiten_clip: float = 20.0,
-        recurrent_filter: bool = True,
+        recurrent_filter: bool = False,
         recurrent_gate_initial_update: float = 0.1,
     ):
         super().__init__()
@@ -339,6 +340,10 @@ class JointGraphTemporalSpectralFilter(nn.Module):
         # full interaction expert. It is intentionally not a Parameter and is
         # therefore absent from checkpoints and optimization.
         self.interaction_activation_override = None
+        # Evaluation-only intervention for a fixed ABC recurrence coefficient.
+        # None uses the learned parameter-update network; 1 exactly recovers
+        # the feed-forward ABC response after every valid transition.
+        self.parameter_update_gate_override = None
         # Evaluation-only calibration: alpha' = floor + (1-floor) * alpha.
         self.interaction_activation_floor_override = None
         # Evaluation-only stress-test multiplier applied after activation.
@@ -383,29 +388,12 @@ class JointGraphTemporalSpectralFilter(nn.Module):
             ]
         )
         recurrent_hidden = max(1, hidden_dim // 2)
-        self.recurrent_latent_norms = nn.ModuleList(
-            [nn.LayerNorm(hidden_dim) for _ in self.windows]
-        )
-        # The previous filtered latent supplies causal spectral context to the
-        # candidate ABC parameters without changing the legacy two-feature
-        # parameter-network shape.  This keeps old frequency-filter weights
-        # loadable while making the recurrent context separately auditable.
-        self.parameter_context_networks = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Linear(hidden_dim, recurrent_hidden),
-                    nn.SiLU(),
-                    nn.Linear(recurrent_hidden, self.chebyshev_order + 1),
-                )
-                for _ in self.windows
-            ]
-        )
-        # One scalar update gate changes the complete response coherently.  It
-        # sees current spectrum statistics, previous eta, previous ABC values,
-        # and current history validity.  A retention-biased initialization
-        # suppresses unsupported frame-to-frame changes while leaving the
-        # first valid frame exactly on the legacy candidate path.
-        recurrent_gate_input = hidden_dim + 2 + (self.chebyshev_order + 1) + 1
+        # The recurrent state is deliberately restricted to the preceding ABC
+        # parameters.  One scalar update coefficient changes the complete
+        # response coherently from the current spectral descriptor, previous
+        # ABC values, and current history validity.  No previous spectral
+        # latent is stored or used by this experiment.
+        recurrent_gate_input = 2 + (self.chebyshev_order + 1) + 1
         self.parameter_update_gates = nn.ModuleList(
             [
                 nn.Sequential(
@@ -417,11 +405,7 @@ class JointGraphTemporalSpectralFilter(nn.Module):
             ]
         )
         gate_bias = torch.logit(torch.tensor(self.recurrent_gate_initial_update))
-        for context_network, gate_network in zip(
-            self.parameter_context_networks, self.parameter_update_gates
-        ):
-            nn.init.xavier_uniform_(context_network[-1].weight, gain=0.05)
-            nn.init.zeros_(context_network[-1].bias)
+        for gate_network in self.parameter_update_gates:
             nn.init.xavier_uniform_(gate_network[-1].weight, gain=0.05)
             with torch.no_grad():
                 gate_network[-1].bias.fill_(float(gate_bias))
@@ -579,10 +563,7 @@ class JointGraphTemporalSpectralFilter(nn.Module):
         temporal_encoder: nn.Module,
         node_entropy: torch.Tensor,
         valid_ratio: torch.Tensor,
-        recurrent_latent_norm: nn.Module,
-        context_network: nn.Module,
         update_gate_network: nn.Module,
-        previous_latent: torch.Tensor,
         previous_parameters: torch.Tensor,
         previous_valid: torch.Tensor,
     ):
@@ -609,6 +590,8 @@ class JointGraphTemporalSpectralFilter(nn.Module):
                 'filter_response_step_rms': residual.new_tensor(float('nan')),
             }, residual.new_zeros(residual.size(0), 3), residual.new_ones(
                 residual.size(0), 1
+            ), residual.new_zeros(residual.size(0), 1), residual.new_zeros(
+                residual.size(0), 1
             )
 
         magnitude = spectrum.abs().mean(dim=1)
@@ -622,13 +605,8 @@ class JointGraphTemporalSpectralFilter(nn.Module):
         # old checkpoint tensor shapes compatible while removing independent
         # per-frequency degrees of freedom.
         spectral_descriptor = torch.cat([energy_ratio, node_entropy], dim=-1)
-        normalized_previous_latent = recurrent_latent_norm(previous_latent)
         previous_mask = previous_valid.to(residual.dtype)
         candidate_raw_parameters = filter_network(spectral_descriptor)
-        if self.recurrent_filter:
-            candidate_raw_parameters = candidate_raw_parameters + (
-                previous_mask * context_network(normalized_previous_latent)
-            )
         candidate_parameters = torch.cat(
             (
                 -F.softplus(candidate_raw_parameters[:, 0:1]),
@@ -638,15 +616,22 @@ class JointGraphTemporalSpectralFilter(nn.Module):
             dim=-1,
         )
         if self.recurrent_filter:
-            proposed_gate = torch.sigmoid(update_gate_network(torch.cat(
-                (
-                    spectral_descriptor,
-                    normalized_previous_latent,
-                    previous_parameters,
-                    valid_ratio,
-                ),
-                dim=-1,
-            )))
+            if self.parameter_update_gate_override is None:
+                proposed_gate = torch.sigmoid(update_gate_network(torch.cat(
+                    (
+                        spectral_descriptor,
+                        previous_parameters,
+                        valid_ratio,
+                    ),
+                    dim=-1,
+                )))
+            else:
+                override = float(self.parameter_update_gate_override)
+                if not 0.0 <= override <= 1.0:
+                    raise ValueError(
+                        "parameter_update_gate_override must be in [0, 1]"
+                    )
+                proposed_gate = torch.full_like(previous_mask, override)
             # With no causal predecessor, bypass the gate so the first valid
             # frame is identical to the original feed-forward ABC filter.
             parameter_update_gate = torch.where(
@@ -708,7 +693,14 @@ class JointGraphTemporalSpectralFilter(nn.Module):
             'parameter_step_norm': parameter_step.detach().mean(),
             'filter_response_step_rms': response_step.detach().mean(),
         }
-        return temporal_latent, diagnostics, parameters, parameter_update_gate
+        return (
+            temporal_latent,
+            diagnostics,
+            parameters,
+            parameter_update_gate,
+            parameter_step,
+            response_step,
+        )
 
     def _encode_with_filter_parameters(
         self,
@@ -1004,9 +996,6 @@ class JointGraphTemporalSpectralFilter(nn.Module):
             )[:, -1:].bool().to(residual.device)
 
         if recurrent_state is None:
-            previous_scale_latents = residual.new_zeros(
-                node_count, scale_count, self.hidden_dim
-            )
             previous_filter_parameters = residual.new_zeros(
                 node_count, scale_count, self.chebyshev_order + 1
             )
@@ -1018,17 +1007,10 @@ class JointGraphTemporalSpectralFilter(nn.Module):
                 device=residual.device,
             )
         else:
-            expected_latent_shape = (node_count, scale_count, self.hidden_dim)
             expected_parameter_shape = (
                 node_count, scale_count, self.chebyshev_order + 1
             )
             expected_valid_shape = (node_count, scale_count, 1)
-            if tuple(recurrent_state.scale_latents.shape) != expected_latent_shape:
-                raise ValueError(
-                    "GASF recurrent latent shape mismatch: "
-                    f"{tuple(recurrent_state.scale_latents.shape)} != "
-                    f"{expected_latent_shape}"
-                )
             if tuple(recurrent_state.filter_parameters.shape) != expected_parameter_shape:
                 raise ValueError(
                     "GASF recurrent parameter shape mismatch: "
@@ -1041,7 +1023,6 @@ class JointGraphTemporalSpectralFilter(nn.Module):
                     f"{tuple(recurrent_state.valid.shape)} != "
                     f"{expected_valid_shape}"
                 )
-            previous_scale_latents = recurrent_state.scale_latents.to(residual)
             previous_filter_parameters = recurrent_state.filter_parameters.to(
                 residual
             )
@@ -1056,34 +1037,36 @@ class JointGraphTemporalSpectralFilter(nn.Module):
         filter_diagnostics = []
         filter_parameters = []
         parameter_update_gates = []
+        parameter_step_norms = []
+        filter_response_steps = []
         for index, (
             window,
             filter_network,
             temporal_encoder,
             scorer,
-            recurrent_latent_norm,
-            context_network,
             update_gate_network,
         ) in enumerate(zip(
             self.windows,
             self.frequency_filters,
             self.temporal_encoders,
             self.scale_scorers,
-            self.recurrent_latent_norms,
-            self.parameter_context_networks,
             self.parameter_update_gates,
         )):
-            latent, diagnostics, parameters, update_gate = self._filter_scale(
+            (
+                latent,
+                diagnostics,
+                parameters,
+                update_gate,
+                parameter_step,
+                response_step,
+            ) = self._filter_scale(
                 residual,
                 window,
                 filter_network,
                 temporal_encoder,
                 node_entropy,
                 valid_ratio,
-                recurrent_latent_norm,
-                context_network,
                 update_gate_network,
-                previous_scale_latents[:, index],
                 previous_filter_parameters[:, index],
                 continuing_state[:, index],
             )
@@ -1091,18 +1074,19 @@ class JointGraphTemporalSpectralFilter(nn.Module):
             latents.append(latent)
             filter_parameters.append(parameters)
             parameter_update_gates.append(update_gate)
+            parameter_step_norms.append(parameter_step)
+            filter_response_steps.append(response_step)
             scores.append(scorer(torch.cat([latent, confidence_features], dim=-1)))
 
         stacked_latents = torch.stack(latents, dim=1)
         stacked_filter_parameters = torch.stack(filter_parameters, dim=1)
         stacked_update_gates = torch.cat(parameter_update_gates, dim=-1)
+        stacked_parameter_steps = torch.cat(parameter_step_norms, dim=-1)
+        stacked_response_steps = torch.cat(filter_response_steps, dim=-1)
         recurrent_valid = current_recurrent_valid.unsqueeze(1).expand(
             -1, scale_count, -1
         )
         recurrent_state = SpectralFilterState(
-            torch.where(
-                recurrent_valid, stacked_latents, torch.zeros_like(stacked_latents)
-            ),
             torch.where(
                 recurrent_valid,
                 stacked_filter_parameters,
@@ -1290,5 +1274,8 @@ class JointGraphTemporalSpectralFilter(nn.Module):
             structure,
             recurrent_state,
             stacked_update_gates,
+            stacked_parameter_steps,
+            stacked_response_steps,
+            continuing_state.squeeze(-1),
         )
 

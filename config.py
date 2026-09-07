@@ -131,6 +131,12 @@ class Args:
                             help='Train on sampled contiguous rollout windows')
         parser.add_argument('--rollout_steps', default=8, type=int,
                             help='Consecutive prediction/update steps per sampled window')
+        parser.add_argument('--teacher_forcing_start', default=1.0, type=float,
+                            help='teacher-forcing probability at epoch zero')
+        parser.add_argument('--teacher_forcing_min', default=0.0, type=float,
+                            help='minimum teacher-forcing probability')
+        parser.add_argument('--teacher_forcing_decay_epochs', default=20, type=int,
+                            help='epochs over which teacher forcing decays; 0 keeps the start value')
         parser.add_argument('--validation_burn_in_steps', default=4, type=int,
                             help='Unscored recurrent warm-up before fixed-window validation')
         parser.add_argument('--event_window_fraction', default=0.5, type=float,
@@ -224,9 +230,9 @@ class Args:
         parser.add_argument('--gasf_graph_mode', default='graph',
                             choices=['graph', 'temporal_only'],
                             help='Use graph propagation after temporal filtering, or temporal filtering only')
-        parser.add_argument('--gasf_recurrent_filter', default=True,
+        parser.add_argument('--gasf_recurrent_filter', default=False,
                             action=argparse.BooleanOptionalAction,
-                            help='use previous per-scale eta and gated ABC parameter recurrence')
+                            help='use gated recurrence of the previous per-scale ABC parameters')
         parser.add_argument('--gasf_recurrent_gate_initial_update', default=0.1,
                             type=float,
                             help='initial candidate fraction of the recurrent ABC update gate')
@@ -409,7 +415,8 @@ class Args:
                                      'graph_context_rollout',
                                      'graph_context_bridge',
                                      'physical_gain',
-                                     'graph_fusion_adapt', 'gate', 'q_adapt',
+                                     'graph_fusion_adapt', 'filter_recurrence',
+                                     'gate', 'q_adapt',
                                      'causal_innovation_expert',
                                      'causal_innovation_gate',
                                      'finetune'])
@@ -427,5 +434,3 @@ class Args:
         parser = self.parse()
         parser = self.initialize(parser)
         return parser.parse_args()
-
-

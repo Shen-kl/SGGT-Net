@@ -67,7 +67,7 @@ def build_model(args):
         covariance_transition=args.covariance_transition,
         gasf_filter_mode=args.gasf_filter_mode,
         gasf_graph_mode=args.gasf_graph_mode,
-        gasf_recurrent_filter=getattr(args, "gasf_recurrent_filter", True),
+        gasf_recurrent_filter=getattr(args, "gasf_recurrent_filter", False),
         gasf_recurrent_gate_initial_update=getattr(
             args, "gasf_recurrent_gate_initial_update", 0.1
         ),
@@ -168,8 +168,6 @@ def load_compatible_state_dict(model, state_dict):
         "decoder.GASF.individual_innovation_encoders.",
         "decoder.GASF.innovation_uncertainty_encoder.",
         "decoder.GASF.innovation_decomposition_projection.",
-        "decoder.GASF.recurrent_latent_norms.",
-        "decoder.GASF.parameter_context_networks.",
         "decoder.GASF.parameter_update_gates.",
         "causal_innovation_corrector.",
     )
@@ -284,6 +282,18 @@ class EventAccumulator:
             effective_norm = activation * delta_norm
             effective_ratio = effective_norm / temporal_norm.clamp_min(1e-8)
 
+        has_filter_transition = (
+            gasf_output is not None
+            and gasf_output.recurrent_transition_valid.numel() > 0
+        )
+        if has_filter_transition:
+            filter_transition_valid = (
+                gasf_output.recurrent_transition_valid.bool().all(dim=-1)
+            )
+            filter_gate = gasf_output.parameter_update_gates.mean(dim=-1)
+            filter_parameter_step = gasf_output.parameter_step_norms.mean(dim=-1)
+            filter_response_step = gasf_output.filter_response_step_rms.mean(dim=-1)
+
         has_q_diagnostics = (
             outputs.q_acceleration_multiplier.numel() > 0
             and outputs.q_innovation_score.numel() > 0
@@ -354,6 +364,21 @@ class EventAccumulator:
             bucket["effective_interaction_ratio_sum"] += float(
                 effective_ratio[mask].sum()
             )
+
+            if has_filter_transition:
+                filter_mask = mask & filter_transition_valid
+                if filter_mask.any():
+                    bucket["filter_transition_count"] += int(filter_mask.sum())
+                    for prefix, values in (
+                        ("filter_gate", filter_gate),
+                        ("filter_parameter_step", filter_parameter_step),
+                        ("filter_response_step", filter_response_step),
+                    ):
+                        selected = values[filter_mask].double()
+                        bucket[prefix + "_sum"] += float(selected.sum())
+                        bucket[prefix + "_square_sum"] += float(
+                            selected.square().sum()
+                        )
 
             if has_q_diagnostics:
                 surprise_values = q_surprise[mask].double()
@@ -491,6 +516,23 @@ class EventAccumulator:
                     bucket["effective_interaction_ratio_sum"] / count
                 ),
             }
+            if bucket["filter_transition_count"] > 0:
+                transition_count = float(bucket["filter_transition_count"])
+                row["filter_transition_count"] = int(transition_count)
+                for prefix, output_name in (
+                    ("filter_gate", "gasf_parameter_update_gate"),
+                    ("filter_parameter_step", "gasf_parameter_step_norm"),
+                    ("filter_response_step", "gasf_filter_response_step_rms"),
+                ):
+                    mean = bucket[prefix + "_sum"] / transition_count
+                    mean_square = (
+                        bucket[prefix + "_square_sum"] / transition_count
+                    )
+                    row[output_name + "_mean"] = mean
+                    row[output_name + "_rms"] = math.sqrt(mean_square)
+                    row[output_name + "_std"] = math.sqrt(
+                        max(mean_square - mean ** 2, 0.0)
+                    )
             if bucket["q_count"] > 0:
                 q_count = float(bucket["q_count"])
                 surprise_mean = bucket["q_surprise_sum"] / q_count

@@ -83,6 +83,13 @@ def main():
     parser.add_argument(
         "--q_response_position_center", type=float, default=1.0,
     )
+    parser.add_argument(
+        "--gasf_recurrent_alpha", type=float,
+        help=(
+            "enable previous-ABC recurrence with a fixed evaluation-only "
+            "update coefficient in [0,1]"
+        ),
+    )
     cli = parser.parse_args()
     device = torch.device(cli.device)
     checkpoint_path = Path(cli.checkpoint).resolve()
@@ -95,6 +102,18 @@ def main():
     args.covariance_transition = payload.get("covariance_transition", "cv")
     args.gasf_filter_mode = payload.get("gasf_filter_mode", "abc")
     args.gasf_graph_mode = payload.get("gasf_graph_mode", "temporal_only")
+    if (
+        cli.gasf_recurrent_alpha is not None
+        and not 0.0 <= cli.gasf_recurrent_alpha <= 1.0
+    ):
+        raise ValueError("gasf_recurrent_alpha must be in [0, 1]")
+    args.gasf_recurrent_filter = bool(
+        payload.get("gasf_recurrent_filter", False)
+        or cli.gasf_recurrent_alpha is not None
+    )
+    args.gasf_recurrent_gate_initial_update = float(
+        payload.get("gasf_recurrent_gate_initial_update", 0.1)
+    )
     args.gasf_fusion_mode = payload.get("gasf_fusion_mode", "concat")
     args.gasf_aux_source = payload.get("gasf_aux_source", "fusion")
     args.innovation_decomposition = bool(
@@ -228,6 +247,11 @@ def main():
     CONFIG.update(config)
     model = build_model(args).to(device)
     load_compatible_state_dict(model, payload["state_dict"])
+    gasf = getattr(model.decoder, "GASF", None)
+    if gasf is None and cli.gasf_recurrent_alpha is not None:
+        raise ValueError("gasf_recurrent_alpha requires a GASF checkpoint")
+    if gasf is not None:
+        gasf.parameter_update_gate_override = cli.gasf_recurrent_alpha
     if cli.process_noise_scale < 0.0:
         raise ValueError("process_noise_scale must be non-negative")
     if cli.position_q_variance is not None and cli.position_q_variance < 0.0:
@@ -307,6 +331,7 @@ def main():
             "q_response_position_center": float(
                 cli.q_response_position_center
             ),
+            "gasf_recurrent_alpha_override": cli.gasf_recurrent_alpha,
             "online_rollout": True,
             "association_augmentation": bool(cli.association_augmentation),
             "association_seed": (
@@ -330,6 +355,10 @@ def main():
             "decoder_use_GASF": args.decoder_use_GASF,
             "decoder_use_SEAN": args.decoder_use_SEAN,
             "gasf_graph_mode": args.gasf_graph_mode,
+            "gasf_recurrent_filter": args.gasf_recurrent_filter,
+            "gasf_recurrent_gate_initial_update": (
+                args.gasf_recurrent_gate_initial_update
+            ),
             "innovation_decomposition": args.innovation_decomposition,
             "causal_innovation_correction": args.causal_innovation_correction,
             "causal_innovation_dynamic_activation": (

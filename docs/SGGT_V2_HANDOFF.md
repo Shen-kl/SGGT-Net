@@ -1285,3 +1285,32 @@ scheduled task `SGGT_P1_MTP_GO_20260904`.
 - Branch/commit at launch: `feature/sggt-v2-causal-innovation`,
   `e192aa680069673ec93bd47d153f989fcc6bf930` (dirty worktree; preserve all
   unrelated user changes).
+
+## 2026-09-07: previous-ABC GASF recurrence rejected
+
+The causal recurrence prototype was reduced to the requested parameter-only
+form: each target and each spectral scale retains only the preceding
+`[a,b,c]` and a validity flag. No preceding spectral latent is stored or used.
+The update is a learned scalar interpolation between the preceding parameters
+and the current feed-forward candidate; invalid targets reset the state and
+newly born targets bypass recurrence.
+
+The implementation passed 108 unit tests and an 8/4 real-V9 CUDA smoke run.
+The recurrence head has 514 parameters, and its state is 1,664 bytes for 64
+targets and two scales. A recurrence-only 32/16 run froze the complete
+converged Temporal model and trained just those 514 parameters. Its best
+position prediction RMSE was 18.87796 m versus 18.85492 m for the frozen
+feed-forward model. The learned valid-transition coefficient remained near
+0.101 and did not separate strong from steady motion.
+
+A decisive no-training scan on fixed `val[0:50]` used 41,827 valid target-time
+points. Position prediction RMSE for alpha 0.10/0.25/0.50/0.75/1.00 was
+18.42704/18.42151/18.41784/18.41518/18.41123 m. Position update RMSE followed
+the same monotone ordering. The best value is alpha 1, which exactly equals the
+feed-forward ABC filter. Alpha 0.5 improved the strong-maneuver subset by only
+0.00525 m while worsening steady motion by 0.01500 m.
+
+Do not enlarge this variant to 200/50 or full-data training and do not add it
+to the paper model. Keep it disabled by default as a diagnostic ablation. Full
+protocol, tables, resource measurements, and artifact paths are in
+`docs/GASF_RECURRENT_ABC_VALIDATION_20260907.md`.
