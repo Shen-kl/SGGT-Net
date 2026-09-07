@@ -1,0 +1,28 @@
+# Python caches and local tooling state
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.tmp/
+.idea/workspace.xml
+
+# Training/evaluation artifacts. Keep their lightweight index in Git; model
+# weights and generated reports remain local and are reproducible from scripts.
+/checkpoint/*
+!/checkpoint/README.md
+/log/
+/results/
+/evaluation_results/
+/evaluation/results/
+
+# LaTeX build products (sources, bibliography files, figures, and diagram
+# sources under docs/paper_revision remain versioned).
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.out
+*.synctex.gz
+docs/paper_revision/*.log
+docs/paper_revision/*.pdf
+docs/paper_revision/~$*

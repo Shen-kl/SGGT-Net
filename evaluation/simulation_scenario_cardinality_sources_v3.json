@@ -1,0 +1,55 @@
+{
+  "ground_truth_label": "Ground truth",
+  "protocol_note": "SGGT-Net uses the current formal comparison protocol (Pd=0.99, clutter=2); the unchanged historical baselines retain their legacy clutter=3 artifacts and Monte Carlo counts.",
+  "method_order": [
+    "MCST-BP",
+    "MTP-GO",
+    "BP-R-RGTT",
+    "SGGT-Net"
+  ],
+  "methods": {
+    "MCST-BP": {
+      "label": "MCST-BP",
+      "kind": "legacy_pickle",
+      "source": "E:/PycharmProjects/Neural Network/SGGT-Net_paper/GNN_version3/data/trajectory1_MCST_lambda_3.pkl",
+      "sha256": "f9a8141ae2c6c9925d5480b86094e55cd66a60d01c556711278f89e76bc9ad19",
+      "protocol_compatible_with_current": false,
+      "color": "#26A76E"
+    },
+    "MTP-GO": {
+      "label": "MTP-GO",
+      "kind": "legacy_pickle",
+      "source": "E:/PycharmProjects/Neural Network/SGGT-Net_paper/GNN_version3/data/trajectory1_proposed_al_without_struct_MCU_lambda_3.pkl",
+      "sha256": "393fe1f788f43628acc9690321589fb3695445a4ee9f750fd4431408555813e8",
+      "protocol_compatible_with_current": false,
+      "color": "#E47820"
+    },
+    "BP-R-RGTT": {
+      "label": "BP-R-RGTT",
+      "kind": "legacy_pickle",
+      "source": "E:/PycharmProjects/Neural Network/SGGT-Net_paper/GNN_version3/data/trajectory1_BP_R_RGTT_lambda_3.pkl",
+      "sha256": "ef19b7907b46037aac8e5775029a2160e2253451606b35b9d64ff7db3b9877bd",
+      "protocol_compatible_with_current": false,
+      "color": "#1A758A"
+    },
+    "SGGT-Net": {
+      "label": "SGGT-Net",
+      "kind": "aggregate_json",
+      "source": "results/paper_simulation_scenario_cardinality_20260903/SGGT_NET_CARDINALITY.json",
+      "protocol_compatible_with_current": true,
+      "color": "#D02528"
+    }
+  },
+  "figure": {
+    "width_inches": 9.0,
+    "height_inches": 5.0,
+    "dpi": 600,
+    "x_label": "Time / s",
+    "y_label": "Estimated number of targets",
+    "legend_fontsize": 8,
+    "marker": "*",
+    "marker_size": 4.8,
+    "marker_every": 2,
+    "line_width": 1.4
+  }
+}

@@ -45,6 +45,13 @@ class Radar:
         self.lambda_FA = external_input.get('lambda_FA')
         self.lambda_FA_PerUnitVolume = external_input.get('lambda_FA_PerUnitVolume')
         self.Pd = external_input.get('Pd')
+        # Robustness experiments may deliberately keep the tracker's assumed
+        # detection probability fixed while varying the data-generating Pd.
+        # Preserve the legacy adaptive-Beta behaviour unless explicitly
+        # disabled by the protocol.
+        self.adaptive_detection_probability = external_input.get(
+            'adaptive_detection_probability', True
+        )
         self.Pf = external_input.get('Pf')
         self.trackProbabilityThreshold = external_input.get('trackProbabilityThreshold')
         self.Vmin = external_input.get('Vmin')
@@ -115,6 +122,79 @@ class Radar:
         """设置雷达分辨率。"""
         self.radar_range_resolution = radar_range_resolution
         self.radar_azi_resolution = radar_azi_resolution
+
+    def group_partition_hypothesis_count(self, track_position):
+        """Return the number of active group-partition hypotheses for a track.
+
+        A neural motion prediction is independent of the legacy partition
+        hypothesis, but measurement evaluation still indexes one prior per
+        hypothesis.  Therefore the same neural prior must be represented for
+        every active hypothesis rather than collapsing the tensor to one
+        column.
+        """
+        try:
+            component_index = int(self.group_manager['IDX'][track_position]) - 1
+            return max(
+                1,
+                len(self.group_manager['group_partition'][component_index]),
+            )
+        except (KeyError, IndexError, TypeError, ValueError):
+            return 1
+
+    def apply_neural_prior_to_all_gm_components(
+            self, track_position, track, X_predict):
+        """Synchronize a shared neural prior with every active GM component.
+
+        The neural motion estimate is shared by the Gaussian-mixture
+        components, while each component keeps its own predicted covariance.
+        Measurement evaluation subsequently indexes every component over all
+        active group-partition hypotheses, so both component and partition
+        axes must be refreshed together on every neural prediction step.
+        """
+        components = track.gmComponents
+        declared_count = int(
+            getattr(track, 'numberOfGmComponents', len(components))
+        )
+        if declared_count != len(components):
+            raise ValueError(
+                "Gaussian-mixture bookkeeping mismatch for track "
+                f"{getattr(track, 'track_index', track_position)}: "
+                f"numberOfGmComponents={declared_count}, "
+                f"len(gmComponents)={len(components)}"
+            )
+        if not components:
+            raise ValueError(
+                "Cannot apply a neural prior to a track without GM components"
+            )
+
+        gm_weights = getattr(track, 'gmWeight', None)
+        if gm_weights is not None and np.size(gm_weights) != declared_count:
+            raise ValueError(
+                "Gaussian-mixture weight mismatch for track "
+                f"{getattr(track, 'track_index', track_position)}: "
+                f"weights={np.size(gm_weights)}, components={declared_count}"
+            )
+
+        hypothesis_count = self.group_partition_hypothesis_count(
+            track_position
+        )
+        representative_P_pred = None
+        for gm_component in components:
+            _, component_P_pred = self.tracker.KalmanPredict(
+                np.zeros_like(X_predict), gm_component.P, track.Q_coe
+            )
+            gm_component.X = X_predict.copy()
+            gm_component.P = component_P_pred.copy()
+            gm_component.X_group_partition = np.repeat(
+                X_predict, hypothesis_count, axis=1
+            )
+            gm_component.P_group_partition = np.repeat(
+                component_P_pred[:, :, None], hypothesis_count, axis=2
+            )
+            if representative_P_pred is None:
+                representative_P_pred = component_P_pred.copy()
+
+        return representative_P_pred
 
     def find_head(self, num):
         """根据航迹号找对应的航迹头。"""
@@ -592,6 +672,17 @@ class Radar:
         edge_features = [t.clone() for t in graph_data.edge_features]
         measurement = graph_data.measurement.clone()
         residual = graph_data.residual.clone()
+        for feature_name in (
+            'innovation_raw', 'innovation_whitened', 'innovation_covariance',
+            'nis_history', 'innovation_valid', 'association_detection_mass',
+            'association_entropy', 'association_spread',
+        ):
+            if hasattr(graph_data, feature_name):
+                setattr(
+                    graph_data_norm,
+                    feature_name,
+                    getattr(graph_data, feature_name).clone(),
+                )
 
         # 根据历史时刻的信息 构建邻接矩阵
         node_num, _, _ = graph_data.x.shape
@@ -678,26 +769,25 @@ class Radar:
 
 
     def rescaler(self, states_input, centroids_offset, config, track_len_for_nn, graph_input, P_scaler):
-        states = states_input.clone().detach().numpy()
+        states = states_input.clone().detach().cpu().numpy()
+        if torch.is_tensor(centroids_offset):
+            centroids_offset = centroids_offset.detach().cpu()
         states = states[...,[0,2,1,3]]
         states[:,0,:,::2] = (states[:,0,:,::2]) * config['S_POS']  + centroids_offset[:,None,:]
         states[:,0,:,1::2] = (states[:,0,:,1::2]) * config['S_VEL']
 
-        for track in self.legacy_PT_set:
+        for track_position, track in enumerate(self.legacy_PT_set):
             if len(track.X) <= track_len_for_nn and track.predict_flag is True:
                 continue
             row_idx = self.graph_builder.track_id_to_row[track.track_index] # 获取行号
 
             X_predict = states[row_idx,0,0,:].reshape(-1,1)
 
-            _, P_pred = self.tracker.KalmanPredict(np.zeros_like(X_predict), track.gmComponents[0].P, track.Q_coe)
+            P_pred = self.apply_neural_prior_to_all_gm_components(
+                track_position, track, X_predict
+            )
 
-            track.gmComponents[0].X = X_predict
-            track.gmComponents[0].P = P_pred.copy()
-            track.gmComponents[0].X_group_partition = np.expand_dims(X_predict, axis=-1)
-            track.gmComponents[0].P_group_partition = np.expand_dims(P_pred, axis=-1)
-
-            track.P_scaler = P_scaler[row_idx, :, :, :]
+            track.P_scaler = P_scaler[row_idx, :, :, :].detach().cpu()
             track.X.append(X_predict)
             track.P = P_pred
             track.X_predict = X_predict
@@ -746,7 +836,8 @@ class Radar:
         :param centroids_x:
         :return:
         '''
-        state_input_renorm = state_input.clone().detach().numpy()
+        state_input_renorm = state_input.clone().detach().cpu().numpy()
+        centroids_x = centroids_x.detach().cpu()
         state_input_renorm = state_input_renorm[...,[0,2,1,3]]
         state_input_renorm[:,:,::2] = (state_input_renorm[:,:,::2]) * self.neural_network['config']['S_POS']  + centroids_x[:,None,:].detach().numpy()
         state_input_renorm[:,:,1::2] = (state_input_renorm[:,:,1::2]) * self.neural_network['config']['S_VEL']
@@ -754,11 +845,18 @@ class Radar:
         return state_input_renorm
 
     def track_mcst_param_init(self):
+        adapter = self.neural_network.get('adapter')
+        if adapter is not None:
+            adapter.initialize_track(self.new_PT_set[-1])
+            return
         self.new_PT_set[-1].avbt_predictor_h = self.neural_network['model'].predictor.init_hidden(self.neural_network['mcst_args'].predictor_sampling_num)
         self.new_PT_set[-1].avbt_predictor_c = self.neural_network['model'].predictor.init_cell(self.neural_network['mcst_args'].predictor_sampling_num)
         self.new_PT_set[-1].avbt_sigma = torch.zeros([1, len(self.new_PT_set[-1].X), 4])
 
     def perform_mcst_predict(self, track):
+        adapter = self.neural_network.get('adapter')
+        if adapter is not None:
+            return adapter.predict_into_radar(self, track)
         # 执行预测
         # 准备输入MCST的数据
         trajectory_len = len(track.X)
@@ -835,6 +933,9 @@ class Radar:
         track.gmWeight = track.gmWeight[:1]
 
     def perform_mcst_update(self, track, detection):
+        adapter = self.neural_network.get('adapter')
+        if adapter is not None:
+            return adapter.update(track, detection)
         # 执行更新
         # 准备输入MCST的数据
         trajectory_len = len(track.X)

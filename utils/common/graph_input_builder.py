@@ -44,6 +44,21 @@ class GraphInputBuilder:
         self.mask_buffer = np.zeros((self.N, self.T, 1), dtype=bool)
         self.meas_buffer = np.zeros((self.N, self.T, self.meas_dim), dtype=np.float32)
         self.residual_buffer = np.zeros((self.N, self.residual_T, self.meas_dim), dtype=np.float32)
+        self.innovation_raw_buffer = np.zeros_like(self.residual_buffer)
+        self.innovation_whitened_buffer = np.zeros_like(self.residual_buffer)
+        self.innovation_covariance_buffer = np.tile(
+            np.eye(self.meas_dim, dtype=np.float32),
+            (self.N, self.residual_T, 1, 1),
+        )
+        self.nis_buffer = np.zeros((self.N, self.residual_T, 1), dtype=np.float32)
+        self.innovation_valid_buffer = np.zeros(
+            (self.N, self.residual_T, 1), dtype=bool
+        )
+        self.association_detection_mass_buffer = np.zeros_like(self.nis_buffer)
+        self.association_entropy_buffer = np.zeros_like(self.nis_buffer)
+        self.association_spread_buffer = np.zeros_like(
+            self.innovation_covariance_buffer
+        )
         self.node_error_cov_matrix_scaler = torch.zeros((self.N, self.n_mixtures, self.feature_dim, self.feature_dim), dtype=torch.float32)
 
         # --- 边历史队列 ---
@@ -77,8 +92,14 @@ class GraphInputBuilder:
         self.meas_buffer[:, :-1, :] = self.meas_buffer[:, 1:, :]
         self.mask_buffer[:, :-1, :] = self.mask_buffer[:, 1:, :]
         self.residual_buffer[:, :-1, :] = self.residual_buffer[:, 1:, :]
-        self.node_buffer[:, :-1, :] = self.node_buffer[:, 1:, :]
-        self.node_buffer[:, :-1, :] = self.node_buffer[:, 1:, :]
+        self.innovation_raw_buffer[:, :-1] = self.innovation_raw_buffer[:, 1:]
+        self.innovation_whitened_buffer[:, :-1] = self.innovation_whitened_buffer[:, 1:]
+        self.innovation_covariance_buffer[:, :-1] = self.innovation_covariance_buffer[:, 1:]
+        self.nis_buffer[:, :-1] = self.nis_buffer[:, 1:]
+        self.innovation_valid_buffer[:, :-1] = self.innovation_valid_buffer[:, 1:]
+        self.association_detection_mass_buffer[:, :-1] = self.association_detection_mass_buffer[:, 1:]
+        self.association_entropy_buffer[:, :-1] = self.association_entropy_buffer[:, 1:]
+        self.association_spread_buffer[:, :-1] = self.association_spread_buffer[:, 1:]
 
         # 2. 清空最新时刻的数据 (Mask 置为 False)
         # 这一步很重要，防止上一帧在此行的数据残留（如果该行对应的目标这一帧消失了）
@@ -86,6 +107,16 @@ class GraphInputBuilder:
         self.meas_buffer[:, -1, :] = 0
         self.mask_buffer[:, -1, :] = False
         self.residual_buffer[:, -1, :] = 0
+        self.innovation_raw_buffer[:, -1] = 0
+        self.innovation_whitened_buffer[:, -1] = 0
+        self.innovation_covariance_buffer[:, -1] = np.eye(
+            self.meas_dim, dtype=np.float32
+        )
+        self.nis_buffer[:, -1] = 0
+        self.innovation_valid_buffer[:, -1] = False
+        self.association_detection_mass_buffer[:, -1] = 0
+        self.association_entropy_buffer[:, -1] = 0
+        self.association_spread_buffer[:, -1] = 0
 
         # 3. 目标管理与槽位分配
         current_tracks = radar.legacy_PT_set
@@ -115,6 +146,9 @@ class GraphInputBuilder:
                     raise
 
         active_rows_this_frame = []  # 记录当前帧哪些行被激活了 (用于算边)
+        # Keep durations aligned with rows that actually fit in the fixed-size
+        # graph buffer. Heavy clutter can create more radar tracks than N.
+        active_survival_duration = []
 
         # 处理当前帧的目标
         for track in current_tracks:
@@ -139,28 +173,76 @@ class GraphInputBuilder:
                     self.meas_buffer[row_index, :, :] = 0
                     self.mask_buffer[row_index, :, :] = False
                     self.residual_buffer[row_index, :, :] = 0
+                    self.innovation_raw_buffer[row_index] = 0
+                    self.innovation_whitened_buffer[row_index] = 0
+                    self.innovation_covariance_buffer[row_index] = np.eye(
+                        self.meas_dim, dtype=np.float32
+                    )
+                    self.nis_buffer[row_index] = 0
+                    self.innovation_valid_buffer[row_index] = False
+                    self.association_detection_mass_buffer[row_index] = 0
+                    self.association_entropy_buffer[row_index] = 0
+                    self.association_spread_buffer[row_index] = 0
                     self.node_error_cov_matrix_scaler[row_index, :, :, :] = 0
             if len(track.X) > 0:
                 curr_state = np.array(track.X[-1]).flatten()
-                curr_meas = np.array(track.associate_plot_track[-1]).flatten()
+                curr_meas = np.array(
+                    getattr(
+                        track,
+                        'sggt_association_measurement',
+                        track.associate_plot_track[-1],
+                    )
+                ).flatten()
 
                 # 填充 Buffer 的最后一位 [-1]
                 self.node_buffer[row_index, -1, :] = curr_state
                 self.meas_buffer[row_index, -1, :] = curr_meas
                 self.mask_buffer[row_index, -1, :] = True
-                self.residual_buffer[row_index, -1, :] = curr_meas - curr_state[::2]
+                if hasattr(track, 'sggt_innovation_raw'):
+                    raw = np.asarray(track.sggt_innovation_raw, dtype=np.float32)
+                    white = np.asarray(
+                        track.sggt_innovation_whitened, dtype=np.float32
+                    )
+                    valid = bool(track.sggt_association_valid)
+                    self.residual_buffer[row_index, -1] = raw if valid else 0
+                    self.innovation_raw_buffer[row_index, -1] = raw if valid else 0
+                    self.innovation_whitened_buffer[row_index, -1] = white if valid else 0
+                    self.innovation_covariance_buffer[row_index, -1] = np.asarray(
+                        track.sggt_innovation_covariance, dtype=np.float32
+                    )
+                    self.nis_buffer[row_index, -1, 0] = (
+                        float(track.sggt_nis) if valid else 0.0
+                    )
+                    self.innovation_valid_buffer[row_index, -1, 0] = valid
+                    self.association_detection_mass_buffer[row_index, -1, 0] = float(
+                        track.sggt_association_detection_mass
+                    )
+                    self.association_entropy_buffer[row_index, -1, 0] = float(
+                        track.sggt_association_entropy
+                    )
+                    self.association_spread_buffer[row_index, -1] = np.asarray(
+                        track.sggt_association_spread, dtype=np.float32
+                    )
+                else:
+                    # Backward-compatible legacy fallback. This is not used by
+                    # the formal BP-SGGT adapter because it explicitly writes
+                    # the strict prior innovation before this update.
+                    self.residual_buffer[row_index, -1, :] = (
+                        curr_meas - curr_state[::2]
+                    )
                 self.node_error_cov_matrix_scaler[row_index, :, :, :] = track.P_scaler
                 # 使用量测作为位置信息的输入
                 ################################
                 # self.node_buffer[row_index, -1, ::2] = curr_meas
                 ################################
                 active_rows_this_frame.append(row_index)
+                active_survival_duration.append(len(track.X))
 
         # 4. 计算当前帧的图结构 (Edges)
         # 只计算 active_rows 之间的边
-        survival_duration = [len(track.X) for track in radar.legacy_PT_set]
+        survival_duration = active_survival_duration
         if len(survival_duration) != 0:
-            survival_duration = np.hstack(survival_duration)
+            survival_duration = np.asarray(survival_duration, dtype=int)
         else:
             survival_duration = None
         current_edges, current_dists, current_vels = self._compute_edges(active_rows_this_frame, survival_duration,
@@ -215,6 +297,11 @@ class GraphInputBuilder:
 
         if survival_duration is not None:
             mask = (survival_duration >= duration_threshold)  # True 表示合格
+            if len(mask) != len(active_rows):
+                raise ValueError(
+                    "survival-duration mask must align with active graph rows: "
+                    f"{len(mask)} != {len(active_rows)}"
+                )
             # 合格目标之间才保留边；不合格目标整行整列置 0 除了对角线上的元素
             adj_matrix = adj_matrix * mask[:, None] * mask[None, :]
         # 对角线(即自己跟自己)
@@ -247,6 +334,24 @@ class GraphInputBuilder:
             edge_index=[torch.from_numpy(t).T for t in self.edge_indices_queue],
             edge_features=[torch.from_numpy(t) for t in self.edge_attrs_queue],
             residual=torch.from_numpy(self.residual_buffer.copy()),
+            innovation_raw=torch.from_numpy(self.innovation_raw_buffer.copy()),
+            innovation_whitened=torch.from_numpy(
+                self.innovation_whitened_buffer.copy()
+            ),
+            innovation_covariance=torch.from_numpy(
+                self.innovation_covariance_buffer.copy()
+            ),
+            nis_history=torch.from_numpy(self.nis_buffer.copy()),
+            innovation_valid=torch.from_numpy(self.innovation_valid_buffer.copy()),
+            association_detection_mass=torch.from_numpy(
+                self.association_detection_mass_buffer.copy()
+            ),
+            association_entropy=torch.from_numpy(
+                self.association_entropy_buffer.copy()
+            ),
+            association_spread=torch.from_numpy(
+                self.association_spread_buffer.copy()
+            ),
             P_scaler = self.node_error_cov_matrix_scaler
         )
 # ==========================================

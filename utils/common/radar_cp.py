@@ -565,6 +565,17 @@ class Radar:
         edge_features = [t.clone() for t in graph_data.edge_features]
         measurement = graph_data.measurement.clone()
         residual = graph_data.residual.clone()
+        for feature_name in (
+            'innovation_raw', 'innovation_whitened', 'innovation_covariance',
+            'nis_history', 'innovation_valid', 'association_detection_mass',
+            'association_entropy', 'association_spread',
+        ):
+            if hasattr(graph_data, feature_name):
+                setattr(
+                    graph_data_norm,
+                    feature_name,
+                    getattr(graph_data, feature_name).clone(),
+                )
 
         # 根据历史时刻的信息 构建邻接矩阵
         node_num, _, _ = graph_data.x.shape

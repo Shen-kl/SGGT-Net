@@ -6,6 +6,10 @@ from utils.common.prediction_step import prediction_step
 from utils.common.measurement_evaluation import measurement_evaluation
 from utils.common.loopy_belief_propagation import loopy_belief_propagation
 from utils.common.compute_posterior_spatial_distributions import compute_posterior_spatial_distributions
+from utils.common.bp_sggt_adapter import (
+    attach_bp_association_context,
+    attach_missed_detection_context,
+)
 from utils.common.cal_error import cal_error
 from utils.common.pure_PT import pure_PT
 import matplotlib.pyplot as plt
@@ -61,10 +65,12 @@ if __name__ == '__main__':
                 # 量测评估与迭代数据关联
                 radar, association_info, posterior_parameters = measurement_evaluation(radar)
                 message_aq, message_bv = loopy_belief_propagation(radar, association_info)
+                attach_bp_association_context(radar, association_info, message_aq)
 
                 # 更新后验
                 radar = compute_posterior_spatial_distributions(radar, association_info, message_aq, message_bv, posterior_parameters)
             else:
+                attach_missed_detection_context(radar)
                 # 更新存在概率
                 for track in radar.legacy_PT_set:
                     track.r = track.r * (1 - radar.Pd) / (1 - radar.Pd * track.r)

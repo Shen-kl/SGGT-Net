@@ -51,7 +51,7 @@ class EWTALoss(nn.Module):
         super().__init__()
         self.huber = nn.HuberLoss(reduction='none')
 
-    def forward(self, mu, x, mask, w=1):
+    def forward(self, mu, x, mask, w=1, state_weights=None):
         """
         N = batch size
         T = number of time steps
@@ -64,7 +64,12 @@ class EWTALoss(nn.Module):
         mask.shape (N, T)
         """
         x = x.unsqueeze(2).expand(-1, -1, mu.size(2), -1)  # (N, T, m, k)
-        reg_loss = self.huber(mu, x).sum(dim=-1)  # (N, T, m)
+        coordinate_loss = self.huber(mu, x)
+        if state_weights is not None:
+            coordinate_loss = coordinate_loss * state_weights.to(
+                device=coordinate_loss.device, dtype=coordinate_loss.dtype
+            )
+        reg_loss = coordinate_loss.sum(dim=-1)  # (N, T, m)
         masked_loss = reg_loss * mask[..., None]  # (N, T, m)
         masked_time = masked_loss.sum(1)  # (N, m)
         vals, _ = torch.topk(masked_time, k=w, dim=-1, largest=False)

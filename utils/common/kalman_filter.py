@@ -407,15 +407,21 @@ class KalmanFilter:
 
             # d_norm = 距离范数 (1 x (num_targets - 1))
             d_norm = np.linalg.norm(d_xy, axis=0, keepdims=True)
+            # Coincident tentative tracks can occur under heavy clutter. They
+            # have no defined repulsion direction, so keep their contribution
+            # finite and zero instead of evaluating 0 * infinity.
+            safe_d_norm = np.maximum(d_norm, np.finfo(float).eps)
 
             # f = R1 / (d_norm + R2)
-            f = R1 / (d_norm + R2)
+            f = R1 / (safe_d_norm + R2)
 
             # 斥力项 sum(f/d_norm * d_xy) (2 x 1)
             # np.divide(f, d_norm) 执行广播 (1 x num_targets-1)
             # d_xy 是 2 x num_targets-1
             # 乘法 f/d_norm * d_xy 会在每行上广播
-            repulsion[:, i:i + 1] = np.sum((f / d_norm) * d_xy, axis=1, keepdims=True)
+            repulsion[:, i:i + 1] = np.sum(
+                (f / safe_d_norm) * d_xy, axis=1, keepdims=True
+            )
 
         return repulsion
 

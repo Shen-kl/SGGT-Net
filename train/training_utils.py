@@ -73,10 +73,24 @@ class CovarianceNormalizer:
 
 
 class GraphDataProcessor:
+    @staticmethod
+    def prior_innovation(graph_data, end, delta_t):
+        """CV-prior measurement innovation in physical position units."""
+        states = graph_data.x[:, :end]
+        measurements = graph_data.measurement[:, :end]
+        innovation = measurements.new_zeros(measurements.shape)
+        if end > 1:
+            prior_position = (
+                states[:, :-1, [0, 2]]
+                + float(delta_t) * states[:, :-1, [1, 3]]
+            )
+            innovation[:, 1:] = measurements[:, 1:] - prior_position
+        return innovation
+
     """图数据处理器"""
 
     @staticmethod
-    def init_input_window(graph_data, config, args):
+    def init_input_window(graph_data, config, args, start_bias=0):
         """
         初始化输入窗口数据
 
@@ -94,35 +108,41 @@ class GraphDataProcessor:
         graph_data_tmp = graph_data.clone()
 
         # 裁剪到输入窗口
-        graph_data_tmp.x = graph_data_tmp.x[:, :config['input_graph_window_len'], :]
-        graph_data_tmp.y = graph_data_tmp.y[:, config['input_graph_window_len']:
-                                          config['input_graph_window_len'] + config['output_graph_window_len'], :]
-        graph_data_tmp.measurement = graph_data_tmp.measurement[:, :config['input_graph_window_len'], :]
+        history_end = start_bias + config['input_graph_window_len']
+        target_end = history_end + config['output_graph_window_len']
+        graph_data_tmp.x = graph_data_tmp.x[:, start_bias:history_end, :]
+        graph_data_tmp.y = graph_data_tmp.y[:, history_end:target_end, :]
+        graph_data_tmp.measurement = graph_data_tmp.measurement[:, start_bias:history_end, :]
 
-        graph_data_tmp.measurement_future = graph_data.measurement[:, config['input_graph_window_len']:
-                                                       config['input_graph_window_len'] + config['output_graph_window_len'], :]
+        graph_data_tmp.measurement_future = graph_data.measurement[:, history_end:target_end, :]
 
         # 初始化残差
-        zeros_len = np.max(args.decoder_residual_length) - config['input_graph_window_len']
+        residual_length = int(np.max(args.decoder_residual_length))
+        residual_start = max(0, history_end - residual_length)
+        residual_data = (
+            graph_data.measurement[:, residual_start:history_end, :]
+            - graph_data.x[:, residual_start:history_end, [0, 2]]
+        )
+        zeros_len = residual_length - residual_data.size(1)
         residual_init = torch.cat([
-            torch.zeros([batch, zeros_len, config['z_dimension']]),
-            graph_data_tmp.measurement - graph_data_tmp.x[:, :, [0, 2]]
+            graph_data_tmp.measurement.new_zeros(
+                [batch, zeros_len, config['z_dimension']]
+            ),
+            residual_data
         ], dim=1)
         graph_data_tmp.residual = residual_init
 
         # 裁剪边索引和特征
-        graph_data_tmp.edge_index = graph_data_tmp.edge_index[:config['input_graph_window_len']]
-        graph_data_tmp.edge_features = graph_data_tmp.edge_features[:config['input_graph_window_len']]
+        graph_data_tmp.edge_index = graph_data_tmp.edge_index[start_bias:history_end]
+        graph_data_tmp.edge_features = graph_data_tmp.edge_features[start_bias:history_end]
 
-        graph_data_tmp.tar_edge_index = graph_data_tmp.tar_edge_index[config['input_graph_window_len']:
-                                                                  config['input_graph_window_len'] + config['output_graph_window_len']]
-        graph_data_tmp.tar_edge_features = graph_data_tmp.tar_edge_features[config['input_graph_window_len']:
-                                                                      config['input_graph_window_len'] + config['output_graph_window_len']]
+        graph_data_tmp.tar_edge_index = graph_data_tmp.tar_edge_index[history_end:target_end]
+        graph_data_tmp.tar_edge_features = graph_data_tmp.tar_edge_features[history_end:target_end]
+        graph_data_tmp.struct_feat = graph_data_tmp.struct_feat[history_end:target_end]
 
         # 更新掩码
-        graph_data_tmp.nan_mask = graph_data_tmp.nan_mask[:, :config['input_graph_window_len'], :]
-        graph_data_tmp.real_mask = graph_data.real_mask[:, config['input_graph_window_len']:
-                                                        config['input_graph_window_len'] + config['output_graph_window_len'], :]
+        graph_data_tmp.nan_mask = graph_data_tmp.nan_mask[:, start_bias:history_end, :]
+        graph_data_tmp.real_mask = graph_data.real_mask[:, history_end:target_end, :]
 
         return graph_data_tmp
 
@@ -163,14 +183,14 @@ class GraphDataProcessor:
             zeros_len = np.max(args.decoder_residual_length) - config['input_graph_window_len'] - bias
             graph_data_tmp.residual[:, :zeros_len, :].zero_()
             graph_data_tmp.residual[:, zeros_len:, :] = (
-                graph_data.measurement[:, :config['input_graph_window_len'] + bias, :] -
-                graph_data.x[:, :config['input_graph_window_len'] + bias, [0, 2]]
+                graph_data.measurement[:, :config['input_graph_window_len'] + bias, :]
+                - graph_data.x[:, :config['input_graph_window_len'] + bias, [0, 2]]
             )
         else:
             begin_idx = bias + config['input_graph_window_len'] - np.max(args.decoder_residual_length)
             data = (
-                graph_data.measurement[:, begin_idx:config['input_graph_window_len'] + bias, :] -
-                graph_data.x[:, begin_idx:config['input_graph_window_len'] + bias, [0, 2]]
+                graph_data.measurement[:, begin_idx:config['input_graph_window_len'] + bias, :]
+                - graph_data.x[:, begin_idx:config['input_graph_window_len'] + bias, [0, 2]]
             )
             graph_data_tmp.residual[:, -data.shape[1]:, :] = data
 
@@ -187,6 +207,8 @@ class GraphDataProcessor:
         graph_data_tmp.nan_mask = graph_data.nan_mask[:, bias:config['input_graph_window_len'] + bias, :]
         graph_data_tmp.real_mask = graph_data.real_mask[:, start_idx:
                                                            start_idx + config['output_graph_window_len'], :]
+        graph_data_tmp.struct_feat = graph_data.struct_feat[start_idx:
+                                                            start_idx + config['output_graph_window_len']]
 
         return graph_data_tmp
 
@@ -258,6 +280,21 @@ class TrainingMetrics:
             'velocity_rmse_update': [],
             'location_rmse_measurement': [],
             'f1': [],
+            'grad_norm': [],
+            'cov_min_eig': [],
+            'cov_symmetry_error': [],
+            'counterfactual_base_mse': [],
+            'counterfactual_expert_mse': [],
+            'counterfactual_benefit_rate': [],
+            'loss_predict': [],
+            'loss_update': [],
+            'loss_struct': [],
+            'loss_temporal': [],
+            'loss_aux': [],
+            'loss_nll': [],
+            'loss_q_rank': [],
+            'loss_q_smooth': [],
+            'loss_q_baseline': [],
         }
 
     def add_batch_metrics(self, batch_metrics):

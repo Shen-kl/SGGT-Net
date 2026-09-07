@@ -15,8 +15,20 @@ from utils.mcst.MinMaxScaler import *
 # 外部未定义的变量 (需要用户提供实际值)
 # ----------------------------------------------------------------------
 
-def param_config(trajectory_info, measurement_noise_std):
-    print('=======paramConfig==========')
+def param_config(
+    trajectory_info,
+    measurement_noise_std,
+    nominal_pd=0.99,
+    nominal_clutter_mean=10.0,
+    checkpoint=None,
+    device=None,
+    adaptive_detection_probability=True,
+    neural_measurement_covariance_scale=1.0,
+    verbose=True,
+    neural_network_override=None,
+):
+    if verbose:
+        print('=======paramConfig==========')
     delta_T = trajectory_info['delta_T']  # 假设帧周期 (Frame period T)
 
     # 假设这些变量用于 set_resoultion 方法
@@ -50,11 +62,14 @@ def param_config(trajectory_info, measurement_noise_std):
     external_input['trackProbabilityThreshold'] = 0.6
     external_input['Vmin'] = np.array([-100, -100, -100])  # 目标最小速度 (注意：Python 中通常使用列表或 NumPy 数组)
     external_input['Vmax'] = np.array([100, 100, 100])  # 目标最大速度
-    external_input['Pd'] = 0.99  # 检测概率
+    external_input['Pd'] = float(nominal_pd)  # tracker nominal detection probability
+    external_input['adaptive_detection_probability'] = bool(
+        adaptive_detection_probability
+    )
     external_input['Pf'] = 1e-6  # 虚警概率
 
     observationSpaceVolume = 4e6
-    external_input['lambda_FA'] = 10.0  # 杂波率 泊松分布参数
+    external_input['lambda_FA'] = float(nominal_clutter_mean)
     external_input['lambda_FA_PerUnitVolume'] = external_input['lambda_FA'] / observationSpaceVolume
     external_input['lambda_NT'] = 10 * 1e-3  # 新目标空间率
 
@@ -102,6 +117,10 @@ def param_config(trajectory_info, measurement_noise_std):
 
     # 假设 Radar 类在环境中可用
     radar = Radar(external_input)
+    radar.verbose = bool(verbose)
+    radar.neural_measurement_covariance_scale = float(
+        neural_measurement_covariance_scale
+    )
 
     radar_num = 1 # size(radar, 2)
     radar.set_resoultion(radar_range_resolution, radar_azi_resolution)
@@ -145,11 +164,75 @@ def param_config(trajectory_info, measurement_noise_std):
 
                             radar.tracker = KalmanFilter(F, H, Q, R, radar.tracker_model, hype_param)
 
-                            if radar.use_neural_network:
+                            if radar.use_neural_network and neural_network_override is None:
                                 # 如果启用了神经网络 加载以下参数
-                                args = Args().get_parser()
+                                args = Args().initialize(Args().parse()).parse_args([])
+                                if device is not None:
+                                    args.device = torch.device(device)
                                 args.T = delta_T
                                 config = CONFIG
+
+                                checkpoint_payload = None
+                                if checkpoint:
+                                    checkpoint_payload = torch.load(
+                                        checkpoint,
+                                        map_location=args.device,
+                                        weights_only=False,
+                                    )
+                                    args.decoder_use_GASF = bool(
+                                        checkpoint_payload.get("decoder_use_GASF", True)
+                                    )
+                                    args.decoder_use_SEAN = bool(
+                                        checkpoint_payload.get("decoder_use_SEAN", False)
+                                    )
+                                    for name in (
+                                        "model_variant", "covariance_transition",
+                                        "gasf_filter_mode", "gasf_graph_mode",
+                                        "gasf_fusion_mode", "gasf_aux_source",
+                                        "adaptive_q_mode",
+                                        "adaptive_q_max_multiplier",
+                                        "adaptive_q_max_position_variance",
+                                        "adaptive_q_initial_multiplier",
+                                        "adaptive_q_initial_position_variance",
+                                        "adaptive_q_acceleration",
+                                        "causal_innovation_correction",
+                                        "causal_innovation_history",
+                                        "causal_innovation_hidden_size",
+                                        "causal_innovation_max_position_m",
+                                        "causal_innovation_max_velocity_mps",
+                                        "causal_innovation_dynamic_activation",
+                                        "causal_innovation_activation_floor",
+                                        "causal_innovation_activation_nis_low",
+                                        "causal_innovation_activation_nis_high",
+                                        "causal_innovation_minimum_valid_history",
+                                        "causal_innovation_recent_valid_window",
+                                        "causal_innovation_association_context",
+                                        "causal_innovation_use_peer",
+                                        "association_augmentation",
+                                        "association_pd_min", "association_pd_max",
+                                        "association_clutter_mu_min",
+                                        "association_clutter_mu_max",
+                                        "association_surveillance_side_m",
+                                        "association_max_clutter",
+                                        "association_local_clutter_rate",
+                                        "association_max_local_clutter",
+                                        "association_local_clutter_scale",
+                                        "association_gate_threshold",
+                                        "association_minimum_detection_mass",
+                                        "association_include_target_competitors",
+                                        "association_clutter_requires_detection",
+                                    ):
+                                        if name in checkpoint_payload:
+                                            setattr(args, name, checkpoint_payload[name])
+                                    config = dict(
+                                        checkpoint_payload.get("config", CONFIG)
+                                    )
+                                    config.update({
+                                        "S_VEL": 40.0,
+                                        "S_EDGE_V_DIST": 40.0,
+                                        "output_graph_window_len": 1,
+                                    })
+                                    CONFIG.update(config)
 
                                 # Pure integrators
                                 if args.motion_model == '1Xint':
@@ -197,18 +280,17 @@ def param_config(trajectory_info, measurement_noise_std):
                                                                               use_GASF=args.decoder_use_GASF)
 
                                 # 神经网络模型
-                                track_model = SGGT_Net(args.encoder_input_size, args.encoder_hidden_size,
-                                                    args.encoder_n_heads,
-                                                    args.encoder_n_layers, m_model.mixtures, args.encoder_dropout,
-                                                    args.encoder_gnn_layer, args.encoder_use_edge_features,
-                                                    m_model, args.decoder_max_length, args.decoder_hidden_size,
-                                                    args.decoder_n_heads, args.decoder_n_layers, args.decoder_alpha,
-                                                    args.decoder_dropout,  args.decoder_residual_length,
-                                                             args.decoder_z_dimension, args.decoder_gnn_layer,
-                                 args.decoder_use_GASF, args.decoder_use_SEAN, delta_T)
+                                from evaluation.compare_sean_temporal_v3 import build_model
+                                track_model = build_model(args).to(args.device)
                                 # 加载模型参数
-                                track_model.load_state_dict(
-                                    torch.load(args.checkpoint, map_location=torch.device('cpu'),weights_only=False)['state_dict'])
+                                if checkpoint_payload is not None:
+                                    from evaluation.compare_sean_temporal_v3 import load_compatible_state_dict
+                                    load_compatible_state_dict(
+                                        track_model, checkpoint_payload['state_dict']
+                                    )
+                                else:
+                                    track_model.load_state_dict(
+                                        torch.load(args.checkpoint, map_location=args.device,weights_only=False)['state_dict'])
 
                                 track_model.eval()
 
@@ -224,6 +306,25 @@ def param_config(trajectory_info, measurement_noise_std):
                                                 residual_window_size=32)
 
                                 radar.graph_builder = builder
+                                # The recurrent GASF state is aligned with the
+                                # builder's stable row allocation. A newly
+                                # configured builder therefore starts a fresh
+                                # causal sequence.
+                                radar.sggt_gasf_recurrent_state = None
+
+    if neural_network_override is not None:
+        radar.neural_network = dict(neural_network_override)
+        radar.neural_network.setdefault("model_name", "MCST")
+        radar.track_len_for_nn = int(
+            radar.neural_network.get("warmup_frames", 5)
+        )
+        radar.graph_builder = GraphInputBuilder(
+            window_size=radar.track_len_for_nn,
+            max_targets=64,
+            group_connect_threshold=150.0,
+            residual_window_size=32,
+        )
+        radar.sggt_gasf_recurrent_state = None
 
 
     return radar

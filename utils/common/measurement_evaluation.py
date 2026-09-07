@@ -81,7 +81,11 @@ def measurement_evaluation(radar):
                                 C_index = radar.group_manager['IDX'][tar_index]  # 所在的簇
                                 C_idx_0based = C_index - 1
                                 for weight_index, gmComponent in enumerate(radar.legacy_PT_set[tar_index].gmComponents):
-                                    Pd = gmComponent.Pd['Pd']
+                                    Pd = (
+                                        gmComponent.Pd['Pd']
+                                        if radar.adaptive_detection_probability
+                                        else radar.Pd
+                                    )
 
                                     ##############################  增加MCST稳定性
                                     # Pd = radar.Pd * 0.99
@@ -89,6 +93,21 @@ def measurement_evaluation(radar):
                                     logLikelihoodRatioTerms = np.log(Pd) - np.log(radar.lambda_FA_PerUnitVolume)
 
                                     num_group_partitions = len(radar.group_manager['group_partition'][C_idx_0based])
+                                    x_partition_shape = np.shape(gmComponent.X_group_partition)
+                                    p_partition_shape = np.shape(gmComponent.P_group_partition)
+                                    if (
+                                            len(x_partition_shape) != 2
+                                            or x_partition_shape[1] != num_group_partitions
+                                            or len(p_partition_shape) != 3
+                                            or p_partition_shape[2] != num_group_partitions
+                                    ):
+                                        raise ValueError(
+                                            "Group-partition prior axis mismatch: "
+                                            f"target={tar_index}, component={weight_index}, "
+                                            f"expected={num_group_partitions}, "
+                                            f"X_shape={x_partition_shape}, "
+                                            f"P_shape={p_partition_shape}"
+                                        )
                                     X_update_group_partition = np.zeros((radar.x_dimension, num_group_partitions))
                                     P_update_group_partition = np.zeros((radar.x_dimension, radar.x_dimension,
                                                                          num_group_partitions))
@@ -234,7 +253,11 @@ def measurement_evaluation(radar):
                     alpha0[tar_index] = 1 - current_target.r
                     for gm_comp_index in range(current_target.numberOfGmComponents):
                         # 遍历高斯分量
-                        Pd = current_target.gmComponents[gm_comp_index].Pd['Pd']
+                        Pd = (
+                            current_target.gmComponents[gm_comp_index].Pd['Pd']
+                            if radar.adaptive_detection_probability
+                            else radar.Pd
+                        )
                         alpha0[tar_index] = alpha0[tar_index] + (1 - Pd) * current_target.r * current_target.gmWeight[gm_comp_index]
 
         beta_message[1:, 0] = alpha0.flatten()

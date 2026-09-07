@@ -57,8 +57,94 @@ class CovarianceUtils:
         """确保协方差矩阵对称性"""
         P_sym = (P + P.transpose(-1, -2)) / 2
         # 添加小的正则化项确保正定性
-        P_reg = P_sym + eps * torch.eye(P.shape[-1], device=P.device)
+        P_reg = P_sym + eps * torch.eye(
+            P.shape[-1], device=P.device, dtype=P.dtype
+        )
         return P_reg
+
+    @staticmethod
+    def whiten_innovation(
+        innovation,
+        covariance,
+        valid_mask=None,
+        eps=1e-6,
+        max_norm=20.0,
+    ):
+        """Whiten an innovation and return its normalized innovation squared.
+
+        The symmetric eigendecomposition implements :math:`S^{-1/2}` without
+        choosing a coordinate ordering, unlike a triangular Cholesky factor.
+        This keeps the two-dimensional feature equivariant to rotations of the
+        Cartesian measurement axes.  The relative eigenvalue floor also makes
+        near-singular covariance estimates safe during early training.
+
+        Args:
+            innovation: ``[..., 2]`` or ``[..., 2, 1]`` physical innovation.
+            covariance: ``[..., 2, 2]`` physical innovation covariance.
+            valid_mask: optional mask broadcastable to ``innovation[..., :1]``.
+            eps: relative/absolute eigenvalue floor.
+            max_norm: optional robust upper bound for the whitened vector norm.
+
+        Returns:
+            whitened: tensor with shape ``[..., 2]``.
+            nis: tensor with shape ``[..., 1]``.
+            covariance_safe: detached, symmetric positive definite covariance.
+        """
+        if innovation.shape[-2:] == (2, 1):
+            innovation = innovation.squeeze(-1)
+        if innovation.shape[-1] != covariance.shape[-1]:
+            raise ValueError(
+                "innovation and covariance dimensions do not match: "
+                f"{tuple(innovation.shape)} vs {tuple(covariance.shape)}"
+            )
+
+        # S is an uncertainty estimate, not a feature-learning shortcut.  In
+        # particular, do not let the downstream network reduce its input by
+        # inflating Q and therefore S.
+        covariance = covariance.detach()
+        symmetric = 0.5 * (covariance + covariance.transpose(-1, -2))
+        eigenvalues, eigenvectors = torch.linalg.eigh(symmetric)
+        dimension = covariance.size(-1)
+        mean_eigenvalue = eigenvalues.sum(dim=-1, keepdim=True).abs() / dimension
+        floor = (float(eps) * mean_eigenvalue).clamp_min(float(eps))
+        eigenvalues = eigenvalues.clamp_min(floor)
+        covariance_safe = (
+            eigenvectors
+            @ torch.diag_embed(eigenvalues)
+            @ eigenvectors.transpose(-1, -2)
+        )
+        inverse_sqrt = (
+            eigenvectors
+            @ torch.diag_embed(eigenvalues.rsqrt())
+            @ eigenvectors.transpose(-1, -2)
+        )
+        whitened = (inverse_sqrt @ innovation.unsqueeze(-1)).squeeze(-1)
+        nis = whitened.square().sum(dim=-1, keepdim=True)
+
+        if max_norm is not None:
+            norm = nis.clamp_min(0.0).sqrt()
+            scale = (float(max_norm) / norm.clamp_min(float(max_norm))).clamp_max(1.0)
+            whitened = whitened * scale
+            nis = whitened.square().sum(dim=-1, keepdim=True)
+
+        whitened = torch.nan_to_num(whitened)
+        nis = torch.nan_to_num(
+            nis,
+            nan=0.0,
+            posinf=float(max_norm) ** 2 if max_norm is not None else 0.0,
+            neginf=0.0,
+        )
+        if valid_mask is not None:
+            mask = valid_mask.bool()
+            while mask.ndim < whitened.ndim:
+                mask = mask.unsqueeze(-1)
+            whitened = torch.where(mask, whitened, torch.zeros_like(whitened))
+            nis_mask = mask
+            while nis_mask.ndim > nis.ndim:
+                nis_mask = nis_mask.squeeze(-1)
+            nis = torch.where(nis_mask, nis, torch.zeros_like(nis))
+
+        return whitened, nis, covariance_safe
 
     @staticmethod
     def init_covariance_from_R(R, delta_T, device=None):
@@ -176,15 +262,16 @@ class ExtendedKalmanFilter:
 
         # 构建归一化的观测矩阵
         D = MatrixBuilder.build_scaling_matrix(device)
-        H_bar = self.H @ D
+        H = self.H.to(device=device, dtype=P_pred.dtype)
+        H_bar = H @ D
         R_renorm = R * (CONFIG['S_POS'])**2
 
         # 扩展到批次维度
-        H_batch = self.H.unsqueeze(0).expand(batch, -1, -1)
+        H_batch = H.unsqueeze(0).expand(batch, -1, -1)
         H_bar_batch = H_bar.unsqueeze(0).expand(batch, -1, -1)
 
         # 计算新息
-        innovation = CONFIG['S_POS'] * (Z - X_pred @ self.H.T)
+        innovation = CONFIG['S_POS'] * (Z - X_pred @ H.T)
 
         # 计算新息协方差
         HP = torch.bmm(H_bar_batch, P_pred)

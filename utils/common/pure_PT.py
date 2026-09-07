@@ -139,10 +139,20 @@ def pure_PT(radar, all_trajectory_cnt: int, all_trajectory_history: list):
             measureNoiseCov = torch.from_numpy(measureNoiseCov).permute(2, 0, 1)[:, : CONFIG['z_dimension'],
                               : CONFIG['z_dimension']].to(dtype = torch.float32)
 
-            measureNoiseCov = measureNoiseCov * 100.0
+            measureNoiseCov = measureNoiseCov * float(
+                getattr(radar, "neural_measurement_covariance_scale", 1.0)
+            )
             measureNoiseCov_norm = measureNoiseCov / (CONFIG['S_POS']) ** 2
 
-            state_output, P_update = radar.neural_network['model'].update(state_input_norm[:,-1,:].unsqueeze(1), P_scaler_input, measurement_input_norm[:,-1,:].unsqueeze(1), measureNoiseCov_norm)
+            model_device = next(
+                radar.neural_network['model'].parameters()
+            ).device
+            state_output, P_update = radar.neural_network['model'].update(
+                state_input_norm[:, -1, :].unsqueeze(1).to(model_device),
+                P_scaler_input.to(model_device),
+                measurement_input_norm[:, -1, :].unsqueeze(1).to(model_device),
+                measureNoiseCov_norm.to(model_device),
+            )
 
             # 反归一化
             X_update = radar.rescaler_update_step(state_output, centroids_x)
@@ -150,7 +160,9 @@ def pure_PT(radar, all_trajectory_cnt: int, all_trajectory_history: list):
             # 遍历字典
             for key, value in track_id_to_row.items():
                 radar.legacy_PT_set[key].X[-1] = X_update[value,0,:].reshape(-1,1)
-                radar.legacy_PT_set[key].P_scaler = P_update[value, :, :]
+                radar.legacy_PT_set[key].P_scaler = (
+                    P_update[value, :, :].detach().cpu()
+                )
 
 
     if radar.use_neural_network and radar.neural_network['model_name'] != 'MCST':
@@ -160,6 +172,7 @@ def pure_PT(radar, all_trajectory_cnt: int, all_trajectory_history: list):
 
     # 5. 打印确认航迹数量 (对应 MATLAB 的 disp 语句)
     confirmed_pt_num = sum(1 for track in radar.legacy_PT_set if len(track.X) >= radar.confirm_trajectory_len)
-    print(f'legacy PT num: {confirmed_pt_num}')
+    if getattr(radar, 'verbose', True):
+        print(f'legacy PT num: {confirmed_pt_num}')
 
     return radar, all_trajectory_cnt, all_trajectory_history

@@ -170,7 +170,28 @@ def prediction_step(radar):
         graph_data_norm, centroids_x = radar.minmax_scaler(graph_input, radar.neural_network['config'])
 
         # 输入网络
-        all_states, P_scaler, total_group_num = radar.neural_network['model'].predict(graph_data_norm)
+        model_device = next(
+            radar.neural_network['model'].parameters()
+        ).device
+        graph_data_norm = graph_data_norm.to(model_device)
+        prediction_result = radar.neural_network['model'].predict(
+            graph_data_norm,
+            gasf_recurrent_state=getattr(
+                radar, 'sggt_gasf_recurrent_state', None
+            ),
+            return_recurrent_state=True,
+        )
+        (
+            all_states,
+            P_scaler,
+            total_group_num,
+            gasf_recurrent_state,
+        ) = prediction_result
+        radar.sggt_gasf_recurrent_state = (
+            gasf_recurrent_state.detach()
+            if gasf_recurrent_state is not None
+            else None
+        )
 
         # 反归一化
         radar.neural_network['config']['centroids_offset'] = centroids_x

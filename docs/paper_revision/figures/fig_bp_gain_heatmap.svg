@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="470" viewBox="0 0 1000 470">
+<title>P4 improvement over P2 under detection and clutter stress</title>
+<rect width="100%" height="100%" fill="white"/>
+<style>text{font-family:Arial,Helvetica,sans-serif;fill:#0f172a}.small{font-size:13px}.tick{font-size:12px;fill:#475569}.label{font-size:15px;font-weight:600}.title{font-size:19px;font-weight:700}</style>
+<text x="500.0" y="32.0" class="title" text-anchor="middle">P4 improvement over P2 under BP association stress</text>
+<text x="500.0" y="55.0" class="tick" text-anchor="middle">Positive values indicate lower error for P4; each cell pools 3 scenes × 20 Monte Carlo rollouts</text>
+<text x="252.5" y="88.0" class="label" text-anchor="middle">Matched position RMSE gain (m)</text>
+<text x="147.5" y="101.0" class="small" text-anchor="middle">10</text>
+<text x="252.5" y="101.0" class="small" text-anchor="middle">20</text>
+<text x="357.5" y="101.0" class="small" text-anchor="middle">30</text>
+<text x="252.5" y="77.0" class="tick" text-anchor="middle">Mean clutter count</text>
+<text x="78.0" y="157.9" class="small" text-anchor="end">0.75</text>
+<rect x="95" y="115" width="105" height="78" fill="#a8c1f7" stroke="white" stroke-width="3"/>
+<text x="147.5" y="159.0" class="label" text-anchor="middle" fill="#0f172a">+0.288</text>
+<rect x="200" y="115" width="105" height="78" fill="#b3c8f8" stroke="white" stroke-width="3"/>
+<text x="252.5" y="159.0" class="label" text-anchor="middle" fill="#0f172a">+0.217</text>
+<rect x="305" y="115" width="105" height="78" fill="#f6c9c9" stroke="white" stroke-width="3"/>
+<text x="357.5" y="159.0" class="label" text-anchor="middle" fill="#0f172a">-0.073</text>
+<text x="78.0" y="235.9" class="small" text-anchor="end">0.85</text>
+<rect x="95" y="193" width="105" height="78" fill="#d0ddfb" stroke="white" stroke-width="3"/>
+<text x="147.5" y="237.0" class="label" text-anchor="middle" fill="#0f172a">+0.023</text>
+<rect x="200" y="193" width="105" height="78" fill="#acc4f7" stroke="white" stroke-width="3"/>
+<text x="252.5" y="237.0" class="label" text-anchor="middle" fill="#0f172a">+0.260</text>
+<rect x="305" y="193" width="105" height="78" fill="#8aabf4" stroke="white" stroke-width="3"/>
+<text x="357.5" y="237.0" class="label" text-anchor="middle" fill="#0f172a">+0.491</text>
+<text x="78.0" y="313.9" class="small" text-anchor="end">0.95</text>
+<rect x="95" y="271" width="105" height="78" fill="#97b5f5" stroke="white" stroke-width="3"/>
+<text x="147.5" y="315.0" class="label" text-anchor="middle" fill="#0f172a">+0.400</text>
+<rect x="200" y="271" width="105" height="78" fill="#306bec" stroke="white" stroke-width="3"/>
+<text x="252.5" y="315.0" class="label" text-anchor="middle" fill="white">+1.087</text>
+<rect x="305" y="271" width="105" height="78" fill="#5283ef" stroke="white" stroke-width="3"/>
+<text x="357.5" y="315.0" class="label" text-anchor="middle" fill="white">+0.858</text>
+<text x="29.0" y="232.0" class="label" text-anchor="middle">Pd</text>
+<text x="742.5" y="88.0" class="label" text-anchor="middle">OSPA gain</text>
+<text x="637.5" y="101.0" class="small" text-anchor="middle">10</text>
+<text x="742.5" y="101.0" class="small" text-anchor="middle">20</text>
+<text x="847.5" y="101.0" class="small" text-anchor="middle">30</text>
+<text x="742.5" y="77.0" class="tick" text-anchor="middle">Mean clutter count</text>
+<text x="568.0" y="157.9" class="small" text-anchor="end">0.75</text>
+<rect x="585" y="115" width="105" height="78" fill="#abc3f7" stroke="white" stroke-width="3"/>
+<text x="637.5" y="159.0" class="label" text-anchor="middle" fill="#0f172a">+0.588</text>
+<rect x="690" y="115" width="105" height="78" fill="#b9cdf9" stroke="white" stroke-width="3"/>
+<text x="742.5" y="159.0" class="label" text-anchor="middle" fill="#0f172a">+0.392</text>
+<rect x="795" y="115" width="105" height="78" fill="#f6caca" stroke="white" stroke-width="3"/>
+<text x="847.5" y="159.0" class="label" text-anchor="middle" fill="#0f172a">-0.140</text>
+<text x="568.0" y="235.9" class="small" text-anchor="end">0.85</text>
+<rect x="585" y="193" width="105" height="78" fill="#aec5f8" stroke="white" stroke-width="3"/>
+<text x="637.5" y="237.0" class="label" text-anchor="middle" fill="#0f172a">+0.545</text>
+<rect x="690" y="193" width="105" height="78" fill="#9fbaf6" stroke="white" stroke-width="3"/>
+<text x="742.5" y="237.0" class="label" text-anchor="middle" fill="#0f172a">+0.768</text>
+<rect x="795" y="193" width="105" height="78" fill="#b0c6f8" stroke="white" stroke-width="3"/>
+<text x="847.5" y="237.0" class="label" text-anchor="middle" fill="#0f172a">+0.516</text>
+<text x="568.0" y="313.9" class="small" text-anchor="end">0.95</text>
+<rect x="585" y="271" width="105" height="78" fill="#306bec" stroke="white" stroke-width="3"/>
+<text x="637.5" y="315.0" class="label" text-anchor="middle" fill="white">+2.385</text>
+<rect x="690" y="271" width="105" height="78" fill="#497dee" stroke="white" stroke-width="3"/>
+<text x="742.5" y="315.0" class="label" text-anchor="middle" fill="white">+2.019</text>
+<rect x="795" y="271" width="105" height="78" fill="#356fec" stroke="white" stroke-width="3"/>
+<text x="847.5" y="315.0" class="label" text-anchor="middle" fill="white">+2.307</text>
+<text x="519.0" y="232.0" class="label" text-anchor="middle">Pd</text>
+<text x="500.0" y="410.0" class="small" text-anchor="middle">Blue = improvement; red = regression. The only common regression is Pd=0.75, clutter=30.</text>
+</svg>

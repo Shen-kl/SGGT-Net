@@ -1,0 +1,34 @@
+{
+  "comparison_order": [
+    "P4",
+    "MCST-BP",
+    "BP-R-RGTT",
+    "MTP-GO"
+  ],
+  "comparison": {
+    "P4": "SGGT-Net",
+    "MCST-BP": "MCST-BP",
+    "BP-R-RGTT": "BP-R-RGTT",
+    "MTP-GO": "MTP-GO"
+  },
+  "robustness_pd_order": [
+    "pd_0p99_clutter_3",
+    "pd_0p90_clutter_3",
+    "pd_0p80_clutter_3"
+  ],
+  "robustness_pd": {
+    "pd_0p99_clutter_3": "$P_D=0.95$",
+    "pd_0p90_clutter_3": "$P_D=0.85$",
+    "pd_0p80_clutter_3": "$P_D=0.75$"
+  },
+  "robustness_clutter_order": [
+    "pd_0p99_clutter_2",
+    "pd_0p99_clutter_10",
+    "pd_0p99_clutter_15"
+  ],
+  "robustness_clutter": {
+    "pd_0p99_clutter_2": "$\\lambda_c=10$",
+    "pd_0p99_clutter_10": "$\\lambda_c=20$",
+    "pd_0p99_clutter_15": "$\\lambda_c=30$"
+  }
+}

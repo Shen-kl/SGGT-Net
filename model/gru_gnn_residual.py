@@ -20,8 +20,40 @@ from typing import NamedTuple
 
 from model.sggt_v2_modules import (
     JointGraphTemporalSpectralFilter,
+    SpectralFilterState,
     TemporalProbabilisticSEAN,
 )
+
+
+class CausalNISProcessNoiseAdapter(nn.Module):
+    """Small two-head adapter for strictly lagged innovation statistics."""
+
+    def __init__(self, input_size, hidden_size, acceleration_probability,
+                 position_probability):
+        super().__init__()
+        self.trunk = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.SiLU(),
+        )
+        self.acceleration_head = nn.Linear(hidden_size, 1)
+        self.position_head = nn.Linear(hidden_size, 2)
+        for head in (self.acceleration_head, self.position_head):
+            nn.init.zeros_(head.weight)
+        with torch.no_grad():
+            self.acceleration_head.bias.fill_(math.log(
+                acceleration_probability / (1.0 - acceleration_probability)
+            ))
+            self.position_head.bias.fill_(math.log(
+                position_probability / (1.0 - position_probability)
+            ))
+
+    def forward(self, features):
+        latent = self.trunk(features)
+        return torch.cat((
+            self.acceleration_head(latent),
+            self.position_head(latent),
+        ), dim=-1)
 
 '''
  改进encoder-decoder 增加残差补偿模块 改进SDE
@@ -466,6 +498,15 @@ class DecoderV2Output(NamedTuple):
     node_entropy: torch.Tensor
     auxiliary_delta_v: torch.Tensor
     film_gate: torch.Tensor
+    policy_gate: torch.Tensor
+    gasf_confidence: torch.Tensor
+    q_acceleration_multiplier: torch.Tensor
+    q_position_noise: torch.Tensor
+    q_innovation_score: torch.Tensor
+    auxiliary_delta_v_temporal: torch.Tensor
+    auxiliary_delta_v_expert: torch.Tensor
+    gasf_recurrent_state: SpectralFilterState | None
+    gasf_parameter_update_gates: torch.Tensor
 
 
 class GRUGNNDecoderV2(nn.Module):
@@ -486,6 +527,20 @@ class GRUGNNDecoderV2(nn.Module):
         gnn_layer="graphconv",
         use_GASF=True,
         use_SEAN=True,
+        gasf_filter_mode="abc",
+        gasf_graph_mode="graph",
+        adaptive_q_mode="legacy",
+        adaptive_q_max_multiplier=5.0,
+        adaptive_q_max_position_variance=400.0,
+        adaptive_q_initial_multiplier=1.0,
+        adaptive_q_initial_position_variance=0.01,
+        adaptive_q_acceleration=True,
+        adaptive_q_tail_boost=0.0,
+        adaptive_q_tail_threshold=0.8,
+        innovation_decomposition=False,
+        innovation_whiten_clip=20.0,
+        gasf_recurrent_filter=True,
+        gasf_recurrent_gate_initial_update=0.1,
     ):
         super().__init__()
         self.gru_cell = GRUGNNCell(
@@ -499,13 +554,42 @@ class GRUGNNDecoderV2(nn.Module):
         )
         self.alpha = alpha
         self.use_GASF = bool(use_GASF)
-        self.use_SEAN = bool(use_SEAN)
+        # V2 spectral SEAN is intentionally defined only inside GASF.  A
+        # standalone SEAN would duplicate the encoder GNN without a residual-
+        # spectrum signal and is no longer a supported formal variant.
+        self.use_SEAN = bool(use_SEAN and use_GASF)
         self.motion_model = motion_model
         self.input_size = motion_model.n_states
         self.output_size = z_dimension
         self.mixtures = motion_model.mixtures
         self.hidden_size = hidden_size
         self.dropout = nn.Dropout(p=dropout)
+        self.adaptive_q_mode = str(adaptive_q_mode)
+        self.adaptive_q_max_multiplier = float(adaptive_q_max_multiplier)
+        self.adaptive_q_max_position_variance = float(adaptive_q_max_position_variance)
+        self.adaptive_q_initial_multiplier = float(adaptive_q_initial_multiplier)
+        self.adaptive_q_initial_position_variance = float(
+            adaptive_q_initial_position_variance
+        )
+        self.adaptive_q_acceleration = bool(adaptive_q_acceleration)
+        # Evaluation/ablation control for an explicitly monotone causal tail
+        # response. Zero preserves the learned adapter exactly.
+        self.q_tail_boost = float(adaptive_q_tail_boost)
+        self.q_tail_position_boost = 0.0
+        self.q_tail_threshold = float(adaptive_q_tail_threshold)
+        # Evaluation-only counterfactual control. ``None`` preserves the
+        # learned adapter; a non-negative value replaces the two direct
+        # position-Q diagonal entries with that physical per-axis variance.
+        # Keeping this control here makes position-Q scans use the exact same
+        # covariance propagation path as training and online BP inference.
+        self.q_position_variance_override_physical = None
+        # Evaluation-only centered response scan.  ``None`` preserves the
+        # learned causal adapter.  Zero replaces its time-varying response by
+        # the supplied fixed means; negative values invert the response and
+        # values above one amplify it.  Training never sets this control.
+        self.q_response_scale_override = None
+        self.q_response_acceleration_center = self.adaptive_q_initial_multiplier
+        self.q_response_position_center = self.adaptive_q_initial_position_variance
 
         self.attn_combine = nn.Linear(hidden_size, hidden_size)
         self.generator = nn.Linear(hidden_size, hidden_size * 4)
@@ -525,20 +609,105 @@ class GRUGNNDecoderV2(nn.Module):
             nn.Linear(hidden_size, 1),
             nn.Sigmoid(),
         )
-
-        if self.use_SEAN:
-            self.SEAN = TemporalProbabilisticSEAN(hidden_size, hidden_size)
+        # Q-v2 is strictly causal: ``residual`` contains innovations only up to
+        # the preceding observed frame.  The final layer is initialized so an
+        # old checkpoint starts close to multiplier=1 and negligible direct
+        # position-model noise.
+        if self.adaptive_q_mode == "causal_nis":
+            if self.adaptive_q_max_multiplier <= 0.25:
+                raise ValueError("causal_nis Q multiplier ceiling must exceed 0.25")
+            if self.adaptive_q_max_position_variance <= 0.0:
+                raise ValueError("causal_nis position-Q ceiling must be positive")
+            initial_multiplier = min(max(
+                self.adaptive_q_initial_multiplier, 0.250001
+            ), self.adaptive_q_max_multiplier - 1e-6)
+            log_minimum = math.log(0.25)
+            log_maximum = math.log(self.adaptive_q_max_multiplier)
+            acceleration_probability = (
+                math.log(initial_multiplier) - log_minimum
+            ) / (log_maximum - log_minimum)
+            acceleration_probability = min(max(
+                acceleration_probability, 1e-4
+            ), 1.0 - 1e-4)
+            # A shifted geometric map reaches zero but keeps a useful slope
+            # around the small (1 m^2) initialization selected by the
+            # scene02 counterfactual scan.
+            position_floor = 0.25
+            initial_position = min(max(
+                self.adaptive_q_initial_position_variance, 0.0
+            ), self.adaptive_q_max_position_variance - 1e-6)
+            position_probability = math.log1p(
+                initial_position / position_floor
+            ) / math.log1p(
+                self.adaptive_q_max_position_variance / position_floor
+            )
+            position_probability = min(max(
+                position_probability, 1e-4
+            ), 1.0 - 1e-4)
+            # hidden + temporal/GASF latent + ten explicit causal statistics
+            self.Q_innovation_encoder = CausalNISProcessNoiseAdapter(
+                hidden_size * 2 + 10,
+                hidden_size,
+                acceleration_probability,
+                position_probability,
+            )
+        elif self.adaptive_q_mode == "innovation":
+            q_feature_size = hidden_size * 2 + 4
+            self.Q_innovation_encoder = nn.Sequential(
+                nn.Linear(q_feature_size, hidden_size),
+                nn.LayerNorm(hidden_size),
+                nn.SiLU(),
+                nn.Linear(hidden_size, 3),
+            )
+            final = self.Q_innovation_encoder[-1]
+            nn.init.zeros_(final.weight)
+            initial_probability = (1.0 - 0.25) / max(
+                self.adaptive_q_max_multiplier - 0.25, 1e-6
+            )
+            initial_probability = min(max(initial_probability, 1e-4), 1.0 - 1e-4)
+            with torch.no_grad():
+                final.bias[0] = math.log(initial_probability / (1.0 - initial_probability))
+                initial_position_variance = 0.01
+                position_probability = initial_position_variance / max(
+                    self.adaptive_q_max_position_variance, initial_position_variance
+                )
+                position_probability = min(max(position_probability, 1e-6), 1.0 - 1e-6)
+                final.bias[1:].fill_(
+                    math.log(position_probability / (1.0 - position_probability))
+                )
         else:
-            self.SEAN = None
+            self.Q_innovation_encoder = None
+
         if self.use_GASF:
             self.GASF = JointGraphTemporalSpectralFilter(
                 hidden_size,
                 windows=tuple(int(value) for value in residual_length),
                 signal_dim=z_dimension,
                 chebyshev_order=2,
+                filter_mode=gasf_filter_mode,
+                graph_mode=gasf_graph_mode,
+                use_sean=self.use_SEAN,
+                use_context_activation=(
+                    self.use_SEAN
+                    and self.motion_model.interaction_physical_residual
+                ),
+                interaction_activation_floor=(
+                    self.motion_model.interaction_activation_floor
+                ),
+                innovation_decomposition=innovation_decomposition,
+                innovation_whiten_clip=innovation_whiten_clip,
+                recurrent_filter=gasf_recurrent_filter,
+                recurrent_gate_initial_update=(
+                    gasf_recurrent_gate_initial_update
+                ),
             )
         else:
             self.GASF = None
+
+    @property
+    def SEAN(self):
+        """Expose embedded SEAN for diagnostics and staged optimization."""
+        return self.GASF.SEAN if self.GASF is not None else None
 
     def process_noise_matrix(self, x1, x2, x3, batch_size, scale_features):
         sig1 = F.softplus(self.sig_1(x1))
@@ -557,7 +726,192 @@ class GRUGNNDecoderV2(nn.Module):
         noise_scale = self.Q_scaler(scale_features).unsqueeze(1).unsqueeze(1)
         return noise_scale * q_t
 
+    def _causal_nis_statistics(self, innovation_bundle, residual):
+        """Summarize only innovations already present before prediction t."""
+        node_count, history_length = residual.shape[:2]
+        if innovation_bundle is None:
+            return residual.new_zeros(node_count, 10)
+        valid = innovation_bundle.get('valid')
+        whitened = innovation_bundle.get('whitened')
+        raw = innovation_bundle.get('raw')
+        nis = innovation_bundle.get('nis')
+        if any(value is None for value in (valid, whitened, raw, nis)):
+            return residual.new_zeros(node_count, 10)
+        valid = valid[..., 0].bool()
+        nis = nis[..., 0].to(residual).clamp(min=0.0, max=400.0)
+        whitened = whitened.to(residual)
+        raw = raw.to(residual)
+        if valid.size(1) != history_length:
+            length = min(valid.size(1), history_length)
+            valid = valid[:, -length:]
+            nis = nis[:, -length:]
+            whitened = whitened[:, -length:]
+            raw = raw[:, -length:]
+            history_length = length
+        weight = valid.to(residual.dtype)
+        denominator = weight.sum(dim=1, keepdim=True).clamp_min(1.0)
+        mean_nis = (nis * weight).sum(dim=1, keepdim=True) / denominator
+        maximum_nis = torch.where(
+            valid, nis, torch.zeros_like(nis)
+        ).amax(dim=1, keepdim=True)
+        indices = torch.arange(
+            history_length, device=residual.device
+        ).view(1, -1).expand(node_count, -1)
+        last_index = torch.where(
+            valid, indices, torch.zeros_like(indices)
+        ).amax(dim=1)
+        gather_index = last_index.view(-1, 1)
+        latest_nis = nis.gather(1, gather_index)
+        latest_white = whitened.gather(
+            1, gather_index.unsqueeze(-1).expand(-1, 1, 2)
+        ).squeeze(1)
+        has_history = valid.any(dim=1, keepdim=True)
+        latest_nis = torch.where(
+            has_history, latest_nis, torch.zeros_like(latest_nis)
+        )
+        latest_white = torch.where(
+            has_history, latest_white, torch.zeros_like(latest_white)
+        )
+        mean_white = (
+            whitened * weight.unsqueeze(-1)
+        ).sum(dim=1) / denominator
+        raw_norm_square = raw.square().sum(dim=-1)
+        raw_rms = (
+            (raw_norm_square * weight).sum(dim=1, keepdim=True) / denominator
+        ).sqrt() / float(CONFIG['S_RES'])
+        if history_length > 1:
+            pair_valid = valid[:, 1:] & valid[:, :-1]
+            pair_weight = pair_valid.to(residual.dtype)
+            pair_denominator = pair_weight.sum(dim=1, keepdim=True).clamp_min(1.0)
+            raw_delta_square = (raw[:, 1:] - raw[:, :-1]).square().sum(dim=-1)
+            raw_delta_rms = (
+                (raw_delta_square * pair_weight).sum(dim=1, keepdim=True)
+                / pair_denominator
+            ).sqrt() / float(CONFIG['S_RES'])
+        else:
+            raw_delta_rms = raw_rms.new_zeros(raw_rms.shape)
+        statistics = torch.cat((
+            torch.log1p(mean_nis),
+            torch.log1p(maximum_nis),
+            torch.log1p(latest_nis),
+            weight.mean(dim=1, keepdim=True),
+            mean_white,
+            latest_white,
+            torch.log1p(raw_rms),
+            torch.log1p(raw_delta_rms),
+        ), dim=-1)
+        return torch.nan_to_num(statistics, nan=0.0, posinf=20.0, neginf=-20.0)
+
+    def adaptive_process_noise(
+        self, hidden, gasf_features, residual, innovation_bundle=None
+    ):
+        """Return acceleration multiplier and normalized position-only Q.
+
+        No current/future measurement is read here.  Position variance is
+        represented separately because G q G^T couples position and velocity.
+        """
+        node_count = hidden.size(0)
+        residual_norm = torch.linalg.vector_norm(residual, dim=-1)
+        delta = residual[:, 1:] - residual[:, :-1]
+        delta_norm = torch.linalg.vector_norm(delta, dim=-1)
+        statistics = torch.stack((
+            torch.log1p(residual_norm.square().mean(dim=-1).sqrt()),
+            torch.log1p(residual_norm.amax(dim=-1)),
+            torch.log1p(delta_norm.square().mean(dim=-1).sqrt()),
+            torch.log1p(residual_norm[:, -1]),
+        ), dim=-1)
+        if self.Q_innovation_encoder is None:
+            multiplier = hidden.new_ones(node_count, 1)
+            if self.q_tail_boost > 0.0:
+                tail = F.relu(statistics[:, :1] - float(self.q_tail_threshold))
+                multiplier = (multiplier + self.q_tail_boost * tail).clamp(
+                    max=self.adaptive_q_max_multiplier
+                )
+            position_q = hidden.new_zeros(node_count, 1, 4, 4)
+            override = self.q_position_variance_override_physical
+            if override is not None:
+                normalized = float(override) / float(CONFIG['S_POS']) ** 2
+                position_q[:, 0, 0, 0] = normalized
+                position_q[:, 0, 1, 1] = normalized
+            return multiplier, position_q, statistics[:, :1]
+        if self.adaptive_q_mode == "causal_nis":
+            statistics = self._causal_nis_statistics(
+                innovation_bundle, residual
+            )
+        raw = self.Q_innovation_encoder(
+            torch.cat((hidden, gasf_features, statistics), dim=-1)
+        )
+        if self.adaptive_q_mode == "causal_nis":
+            log_minimum = math.log(0.25)
+            log_maximum = math.log(self.adaptive_q_max_multiplier)
+            multiplier = torch.exp(
+                log_minimum
+                + (log_maximum - log_minimum) * torch.sigmoid(raw[:, :1])
+            )
+        else:
+            multiplier = 0.25 + (
+                self.adaptive_q_max_multiplier - 0.25
+            ) * torch.sigmoid(raw[:, :1])
+        if not self.adaptive_q_acceleration:
+            multiplier = torch.ones_like(multiplier)
+        if self.q_tail_boost > 0.0:
+            tail = F.relu(statistics[:, :1] - float(self.q_tail_threshold))
+            multiplier = multiplier + float(self.q_tail_boost) * tail
+            multiplier = multiplier.clamp(max=self.adaptive_q_max_multiplier)
+        response_scale = self.q_response_scale_override
+        if response_scale is not None:
+            acceleration_center = float(self.q_response_acceleration_center)
+            multiplier = acceleration_center + float(response_scale) * (
+                multiplier - acceleration_center
+            )
+            multiplier = multiplier.clamp(
+                min=0.25, max=self.adaptive_q_max_multiplier
+            )
+        # These heads predict physical position standard deviations.  Convert
+        # their variances to normalized covariance coordinates here.
+        if self.adaptive_q_mode == "causal_nis":
+            position_floor = 0.25
+            log_span = math.log1p(
+                self.adaptive_q_max_position_variance / position_floor
+            )
+            position_variance_physical = position_floor * torch.expm1(
+                log_span * torch.sigmoid(raw[:, 1:3])
+            )
+        else:
+            position_variance_physical = (
+                self.adaptive_q_max_position_variance
+                * torch.sigmoid(raw[:, 1:3])
+            )
+        if response_scale is not None:
+            position_center = float(self.q_response_position_center)
+            position_variance_physical = position_center + float(response_scale) * (
+                position_variance_physical - position_center
+            )
+            position_variance_physical = position_variance_physical.clamp(
+                min=0.0, max=self.adaptive_q_max_position_variance
+            )
+        position_variance = position_variance_physical / float(CONFIG['S_POS']) ** 2
+        position_q = hidden.new_zeros(node_count, 1, 4, 4)
+        position_q[:, 0, 0, 0] = position_variance[:, 0]
+        position_q[:, 0, 1, 1] = position_variance[:, 1]
+        if self.q_tail_position_boost > 0.0:
+            tail = F.relu(statistics[:, :1] - float(self.q_tail_threshold))
+            extra_physical = float(self.q_tail_position_boost) * tail
+            extra_normalized = extra_physical / float(CONFIG['S_POS']) ** 2
+            position_q[:, 0, 0, 0] = position_q[:, 0, 0, 0] + extra_normalized[:, 0]
+            position_q[:, 0, 1, 1] = position_q[:, 0, 1, 1] + extra_normalized[:, 0]
+        override = self.q_position_variance_override_physical
+        if override is not None:
+            normalized = float(override) / float(CONFIG['S_POS']) ** 2
+            position_q[:, 0, 0, 0] = normalized
+            position_q[:, 0, 1, 1] = normalized
+        return multiplier, position_q, statistics[:, :1]
+
     def forward(self, data):
+        if len(data) not in (9, 10, 11, 12):
+            raise ValueError(
+                f"V2 decoder expects 9 to 12 inputs, got {len(data)}"
+            )
         (
             x,
             hidden,
@@ -568,7 +922,13 @@ class GRUGNNDecoderV2(nn.Module):
             batch,
             nan_mask,
             residual,
-        ) = data
+        ) = data[:9]
+        if len(data) >= 10:
+            innovation_bundle = data[9]
+        else:
+            innovation_bundle = None
+        gasf_recurrent_state = data[10] if len(data) >= 11 else None
+        recurrent_valid_mask = data[11] if len(data) >= 12 else None
         batch_size = x.size(0)
 
         time_steps = encoder_out.shape[1]
@@ -595,40 +955,63 @@ class GRUGNNDecoderV2(nn.Module):
             output, edge_index, hidden, edge_attr=projected_edge
         )
 
-        valid_nodes = nan_mask.reshape(nan_mask.size(0), -1).all(dim=-1, keepdim=True)
-        if self.use_SEAN:
-            structure = self.SEAN(batch, past_state, hidden, valid_nodes)
-            structural_features = structure.structural_features
-            learned_edge_index = structure.edge_index
-            learned_edge_weight = structure.edge_weight
-            node_entropy = structure.node_entropy
-            adjacency_vector = structure.adjacency_vector
-            adjacency_mask = structure.vector_mask
-            group_count = structure.group_count
-        else:
-            structural_features = torch.zeros_like(hidden)
-            learned_edge_index = edge_index
-            learned_edge_weight = projected_edge
-            node_entropy = torch.ones(batch_size, 1, device=hidden.device)
-            adjacency_vector = hidden.new_empty(0)
-            adjacency_mask = torch.empty(0, dtype=torch.bool, device=hidden.device)
-            group_count = 0
-
+        node_entropy = torch.ones(batch_size, 1, device=hidden.device)
+        adjacency_vector = hidden.new_empty(0)
+        adjacency_mask = torch.empty(0, dtype=torch.bool, device=hidden.device)
+        group_count = 0
+        temporal_gasf = interaction_expert_gasf = torch.zeros_like(hidden)
         if self.use_GASF:
             spectral = self.GASF(
                 residual,
-                learned_edge_index,
-                learned_edge_weight,
+                edge_index,
+                projected_edge,
                 node_entropy,
                 nan_mask,
+                batch=batch,
+                states=past_state,
+                innovation_bundle=innovation_bundle,
+                recurrent_state=gasf_recurrent_state,
+                recurrent_valid_mask=recurrent_valid_mask,
             )
             gasf_features = spectral.latent
             gasf_confidence = spectral.confidence
             spectral_weights = spectral.scale_weights
+            temporal_gasf = spectral.temporal_latent
+            interaction_expert_gasf = (
+                spectral.temporal_latent + spectral.interaction_delta
+            )
+            if self.motion_model.interaction_physical_residual:
+                # The physically aligned interaction path replaces, rather
+                # than stacks with, the poorly conditioned latent increment.
+                gasf_features = spectral.temporal_latent
+                interaction_expert_gasf = spectral.temporal_latent
+            structure = spectral.structure
+            node_entropy = structure.node_entropy
+            adjacency_vector = structure.adjacency_vector
+            adjacency_mask = structure.vector_mask
+            group_count = structure.group_count
+            auxiliary_delta_v_temporal = self.motion_model.aux_velocity_head(
+                temporal_gasf
+            )
+            auxiliary_delta_v_expert = self.motion_model.aux_velocity_head(
+                interaction_expert_gasf
+            )
+            gasf_recurrent_state = spectral.recurrent_state
+            gasf_parameter_update_gates = spectral.parameter_update_gates
         else:
             gasf_features = torch.zeros_like(hidden)
             gasf_confidence = torch.zeros(batch_size, 1, device=hidden.device)
             spectral_weights = torch.zeros(batch_size, 0, device=hidden.device)
+            auxiliary_delta_v_temporal = torch.zeros(
+                batch_size, 2, device=hidden.device
+            )
+            auxiliary_delta_v_expert = torch.zeros(
+                batch_size, 2, device=hidden.device
+            )
+            gasf_recurrent_state = None
+            gasf_parameter_update_gates = torch.zeros(
+                batch_size, 0, device=hidden.device
+            )
 
         generated = self.dropout(
             F.leaky_relu(
@@ -636,17 +1019,37 @@ class GRUGNNDecoderV2(nn.Module):
             )
         )
         x1, x2, x3, x4 = torch.split(generated, self.hidden_size, dim=-1)
-        scale_features = structural_features if self.use_SEAN else hidden
+        # Keep the base dynamics and process-noise path identical to the
+        # no-SEAN baseline; SEAN controls only the residual GASF/FiLM path.
+        scale_features = hidden
         process_noise = self.process_noise_matrix(
             x1, x2, x3, batch_size, scale_features
         )
+        q_multiplier, q_position_noise, q_innovation_score = self.adaptive_process_noise(
+            hidden, gasf_features, residual, innovation_bundle
+        )
+        # process_noise is [node, mixture, 2, 2] while q_multiplier is
+        # [node, 1].  Two explicit matrix axes are required; unsqueeze(1)
+        # alone broadcasts the node dimension into the mixture dimension and
+        # creates an erroneous [node, node, 2, 2] tensor for mixture=1.
+        process_noise = process_noise * q_multiplier.unsqueeze(-1).unsqueeze(-1)
 
         model_input = {'gnn_model_output': x4}
-        if self.use_SEAN:
-            model_input['struct_feats'] = structural_features
         if self.use_GASF:
             model_input['GASF_output_fusion'] = gasf_features
             model_input['GASF_confidence'] = gasf_confidence
+            # These features are consumed only by the optional trajectory-
+            # supervised counterfactual branches in SGGT_Net.
+            model_input['GASF_output_temporal'] = temporal_gasf
+            model_input['GASF_output_interaction_expert'] = interaction_expert_gasf
+            raw_interaction_context = spectral.interaction_context
+            model_input['GASF_interaction_context'] = (
+                gasf_confidence * raw_interaction_context
+            )
+            model_input['GASF_interaction_context_temporal'] = torch.zeros_like(
+                raw_interaction_context
+            )
+            model_input['GASF_interaction_context_expert'] = raw_interaction_context
 
         next_state, model_input = self.motion_model(
             past_state, model_input, static_f=None
@@ -663,6 +1066,15 @@ class GRUGNNDecoderV2(nn.Module):
             node_entropy,
             model_input['auxiliary_delta_v'],
             model_input['film_gate'],
+            model_input['policy_gate'],
+            model_input['gasf_confidence_effective'],
+            q_multiplier,
+            q_position_noise,
+            q_innovation_score,
+            auxiliary_delta_v_temporal,
+            auxiliary_delta_v_expert,
+            gasf_recurrent_state,
+            gasf_parameter_update_gates,
         )
 
     def get_initial_state(self, last_enc_state, data):
