@@ -4,6 +4,7 @@ param(
     [int]$Epochs = 10,
     [int]$Seed = 123,
     [double]$MaxAccelerationMps2 = 5.0,
+    [switch]$OwnOnly,
     [string]$TemporalCheckpoint = (
         "checkpoint\formal_innovation_v1\seed_123\A_temporal\" +
         "GNN_groupTargetTracking\best_prediction.pth"
@@ -14,6 +15,16 @@ param(
 $ErrorActionPreference = "Stop"
 $sggtPython = "H:\Anaconda3\envs\py310_torch\python.exe"
 $dataRoot = "E:\Dataset\GroupTargetsDataset_dataRate_2_v9_pack"
+$historyMode = if ($OwnOnly) { "own_only" } else { "own_peer" }
+$peerArgument = if ($OwnOnly) {
+    "--no-causal_innovation_use_peer"
+} else {
+    "--causal_innovation_use_peer"
+}
+
+if (-not (Test-Path -LiteralPath $TemporalCheckpoint)) {
+    throw "Temporal checkpoint not found: $TemporalCheckpoint"
+}
 
 $arguments = @(
     "main_v3.py",
@@ -59,7 +70,7 @@ $arguments = @(
     "--causal_innovation_minimum_valid_history", "4",
     "--causal_innovation_recent_valid_window", "3",
     "--no-causal_innovation_association_context",
-    "--causal_innovation_use_peer",
+    $peerArgument,
     "--no-causal_innovation_dynamic_activation",
     "--training_stage", "causal_innovation_expert",
     "--lambda_struct", "0",
@@ -78,7 +89,11 @@ $arguments = @(
     "--lambda_causal_velocity_guard", "0"
 )
 
-Write-Output "START $RunName at $(Get-Date -Format o)"
+Write-Output (
+    "START $RunName mode=$historyMode train=$TrainSamples val=$ValSamples " +
+    "epochs=$Epochs seed=$Seed max_acceleration=$MaxAccelerationMps2 at " +
+    "$(Get-Date -Format o)"
+)
 & $sggtPython @arguments
 if ($LASTEXITCODE -ne 0) {
     throw "$RunName failed with exit code $LASTEXITCODE"
