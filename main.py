@@ -190,7 +190,20 @@ if __name__ == '__main__':
                                  adaptive_q_tail_boost=args.adaptive_q_tail_boost,
                                  adaptive_q_tail_threshold=args.adaptive_q_tail_threshold,
                                  innovation_decomposition=args.innovation_decomposition,
-                                 innovation_whiten_clip=args.innovation_whiten_clip)
+                                 innovation_whiten_clip=args.innovation_whiten_clip,
+                                 causal_innovation_correction=args.causal_innovation_correction,
+                                 causal_innovation_history=args.causal_innovation_history,
+                                 causal_innovation_hidden_size=args.causal_innovation_hidden_size,
+                                 causal_innovation_max_acceleration_mps2=(
+                                     args.causal_innovation_max_acceleration_mps2
+                                 ),
+                                 causal_innovation_minimum_valid_history=(
+                                     args.causal_innovation_minimum_valid_history or None
+                                 ),
+                                 causal_innovation_recent_valid_window=(
+                                     args.causal_innovation_recent_valid_window
+                                 ),
+                                 causal_innovation_use_peer=args.causal_innovation_use_peer)
 
 
 
@@ -310,6 +323,22 @@ if __name__ == '__main__':
             parameter.requires_grad = False
         for parameter in track_model.decoder.Q_innovation_encoder.parameters():
             parameter.requires_grad = True
+    elif args.training_stage == 'causal_innovation_expert':
+        if not args.causal_innovation_correction:
+            raise ValueError(
+                "causal_innovation_expert requires --causal_innovation_correction"
+            )
+        for parameter in track_model.parameters():
+            parameter.requires_grad = False
+        for parameter in track_model.causal_innovation_corrector.parameters():
+            parameter.requires_grad = True
+        track_model.counterfactual_training = True
+        track_model.counterfactual_evaluation = True
+    elif args.training_stage == 'causal_innovation_gate':
+        raise ValueError(
+            "causal_innovation_gate was removed; acceleration CIPIC is always "
+            "active when its causal history is eligible"
+        )
     elif args.training_stage in (
         'graph_expert', 'graph_context', 'graph_context_rollout',
         'graph_context_bridge'

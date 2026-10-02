@@ -133,6 +133,11 @@ class GroupTrackMotionModelBase(nn.Module):
         nn.init.zeros_(self.gasf_gate.weight)
         with torch.no_grad():
             self.gasf_gate.bias.fill_(-2.0)
+        # Optional raw-innovation acceleration corrector. SGGT_Net installs
+        # it only for the CIPIC variant, so the Temporal path is unchanged.
+        self.causal_innovation_corrector = None
+        self.causal_counterfactual_enabled = False
+
     def _build_input_transition_matrix(self):
         """构建输入转移矩阵 G"""
         G = torch.zeros(1, self.mixtures, self.n_states, 2)
@@ -281,6 +286,36 @@ class GroupTrackMotionModelBase(nn.Module):
     def forward(self, past_state, inputs, static_f):
         """前向传播"""
 
+        inputs = dict(inputs)
+        corrector = self.causal_innovation_corrector
+        if corrector is not None:
+            innovation = inputs.get('causal_innovation_bundle')
+            if innovation is None:
+                raise ValueError(
+                    "causal_innovation_bundle is required when CIPIC is enabled"
+                )
+            # Evaluate the base acceleration once at the interval origin. The
+            # Neural ODE itself remains state dependent at every RK4 substep.
+            base_acceleration = self._compute_acceleration(inputs, past_state)
+            correction, eligible, activation, demand = corrector.predict(
+                innovation, base_acceleration
+            )
+            inputs['causal_acceleration_correction'] = correction
+            inputs['causal_innovation_eligible'] = eligible.unsqueeze(-1)
+            inputs['causal_innovation_activation'] = activation
+            inputs['causal_innovation_demand'] = demand
+            inputs['causal_base_acceleration'] = base_acceleration.mean(dim=1)
+            if self.causal_counterfactual_enabled:
+                base_inputs = dict(inputs)
+                base_inputs.pop('causal_acceleration_correction', None)
+                inputs['causal_base_state'] = self.solver(
+                    self.model_update,
+                    past_state,
+                    base_inputs,
+                    static_f,
+                    self.dt,
+                )
+
         next_state = self.solver(
             self.model_update, past_state, inputs, static_f, self.dt
         )
@@ -330,7 +365,7 @@ class GroupTrackMotionModelBase(nn.Module):
 class GroupTrackFullModel(GroupTrackMotionModelBase):
     """完整的群跟踪模型 (包含结构加速度和机动补偿)"""
 
-    def model_update(self, X, u, static_f):
+    def _compute_acceleration(self, u, X):
         feature_fusion = self._extract_inputs(u)
         feature_fusion = feature_fusion.unsqueeze(1).expand(-1, X.size(1), -1)
         inp = torch.cat((self.x_embeding(X), feature_fusion), dim=-1)
@@ -363,6 +398,22 @@ class GroupTrackFullModel(GroupTrackMotionModelBase):
             if not torch.isfinite(torch.as_tensor(direct_gain)).all():
                 raise ValueError("interaction acceleration gain must be finite")
             acc = acc + direct_gain * interaction_context[:, None, :2]
+
+        return acc
+
+    def model_update(self, X, u, static_f):
+        acc = self._compute_acceleration(u, X)
+        causal_correction = u.get('causal_acceleration_correction')
+        if causal_correction is not None:
+            if causal_correction.ndim != 2 or causal_correction.size(-1) != 2:
+                raise ValueError(
+                    "causal_acceleration_correction must have shape [N, 2]"
+                )
+            if causal_correction.size(0) != X.size(0):
+                raise ValueError(
+                    "causal acceleration and state node counts must match"
+                )
+            acc = acc + causal_correction[:, None, :]
 
         dvx = acc[..., 0:1]
         dvy = acc[..., 1:2]

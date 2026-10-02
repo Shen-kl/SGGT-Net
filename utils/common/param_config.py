@@ -198,6 +198,7 @@ def param_config(
                                         "causal_innovation_correction",
                                         "causal_innovation_history",
                                         "causal_innovation_hidden_size",
+                                        "causal_innovation_max_acceleration_mps2",
                                         "causal_innovation_max_position_m",
                                         "causal_innovation_max_velocity_mps",
                                         "causal_innovation_dynamic_activation",

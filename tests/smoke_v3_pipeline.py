@@ -97,9 +97,12 @@ def main():
         ),
         innovation_decomposition=options.innovation_decomposition,
         causal_innovation_correction=options.causal_innovation,
-        causal_innovation_minimum_valid_history=4,
+        causal_innovation_max_acceleration_mps2=5.0,
+        # One real online innovation is sufficient for this two-step smoke;
+        # formal training retains the configured four-frame eligibility rule.
+        causal_innovation_minimum_valid_history=1,
         causal_innovation_recent_valid_window=3,
-        causal_innovation_association_context=options.causal_innovation,
+        causal_innovation_association_context=False,
         association_augmentation=options.association_augmentation,
         association_pd_min=0.75,
         association_pd_max=0.98,
@@ -167,8 +170,16 @@ def main():
     assert torch.isfinite(trainer.last_loss_tensors["cv_guard"])
     assert torch.isfinite(trainer.last_loss_tensors["q_baseline"])
     assert torch.allclose(second_window.residual[:, -1], expected_innovation)
+    if options.causal_innovation:
+        assert output.causal_innovation_correction.shape[-1] == 2
+        assert torch.isfinite(output.causal_innovation_correction).all()
+        assert output.counterfactual_base.numel() > 0
+        torch.testing.assert_close(
+            output.counterfactual_base, output.counterfactual_expert,
+            atol=0.0, rtol=0.0,
+        )
     backward_loss = loss
-    if options.innovation_decomposition:
+    if options.innovation_decomposition or options.causal_innovation:
         # The initial causal window contains no network-generated innovation,
         # so the new branch is intentionally masked. Advance once to verify
         # gradients only after a genuine online residual has been formed.
@@ -192,6 +203,10 @@ def main():
             event_class=second_event,
         )
         assert torch.isfinite(second_output.states).all()
+    causal_weight_before = (
+        model.causal_innovation_corrector.fusion[-1].weight.detach().clone()
+        if options.causal_innovation else None
+    )
     backward_loss.backward()
     assert any(
         parameter.grad is not None and torch.isfinite(parameter.grad).all()
@@ -239,6 +254,20 @@ def main():
             if parameter.grad is not None
         )
         assert q_grad > 0.0
+    if options.causal_innovation:
+        causal_grad = sum(
+            float(parameter.grad.abs().sum())
+            for parameter in model.causal_innovation_corrector.parameters()
+            if parameter.grad is not None
+        )
+        assert causal_grad > 0.0
+    optimizer.step()
+    if options.causal_innovation:
+        causal_weight_after = (
+            model.causal_innovation_corrector.fusion[-1].weight.detach()
+        )
+        assert torch.isfinite(causal_weight_after).all()
+        assert not torch.equal(causal_weight_before, causal_weight_after)
     print({
         "nodes": full.x.size(0),
         "forecast_shape": tuple(output.states.shape),

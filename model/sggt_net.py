@@ -111,6 +111,9 @@ class SGGT_Net(nn.Module):
         causal_innovation_correction=False,
         causal_innovation_history=8,
         causal_innovation_hidden_size=32,
+        causal_innovation_max_acceleration_mps2=5.0,
+        # Deprecated state-correction options retained in the constructor so
+        # legacy launch scripts fail by protocol rather than by signature.
         causal_innovation_max_position_m=50.0,
         causal_innovation_max_velocity_mps=5.0,
         causal_innovation_dynamic_activation=False,
@@ -221,31 +224,39 @@ class SGGT_Net(nn.Module):
             clutter_requires_detection=association_clutter_requires_detection,
         )
         self.causal_innovation_correction = bool(causal_innovation_correction)
-        self.causal_innovation_alpha = 1.0
-        self.causal_innovation_velocity_alpha = 1.0
         self.causal_innovation_dynamic_activation = bool(
             causal_innovation_dynamic_activation
         )
         if self.causal_innovation_correction:
             if model_variant != "sggt_v2":
                 raise ValueError("causal innovation correction requires SGGT-V2")
-            self.causal_innovation_corrector = CausalGroupInnovationCorrector(
+            if self.causal_innovation_dynamic_activation:
+                raise ValueError(
+                    "CIPIC acceleration correction has no confidence gate"
+                )
+            if causal_innovation_association_context:
+                raise ValueError(
+                    "CIPIC acceleration correction uses raw own/peer histories only"
+                )
+            self.decoder.motion_model.causal_innovation_corrector = (
+                CausalGroupInnovationCorrector(
                 history_length=causal_innovation_history,
                 hidden_size=causal_innovation_hidden_size,
                 raw_scale=CONFIG['S_RES'],
-                whiten_clip=innovation_whiten_clip,
-                max_position_m=causal_innovation_max_position_m,
-                max_velocity_mps=causal_innovation_max_velocity_mps,
-                position_scale=CONFIG['S_POS'],
+                max_acceleration_mps2=(
+                    causal_innovation_max_acceleration_mps2
+                ),
                 velocity_scale=CONFIG['S_VEL'],
-                activation_floor=causal_innovation_activation_floor,
-                activation_nis_low=causal_innovation_activation_nis_low,
-                activation_nis_high=causal_innovation_activation_nis_high,
                 minimum_valid_history=causal_innovation_minimum_valid_history,
                 recent_valid_window=causal_innovation_recent_valid_window,
-                association_context=causal_innovation_association_context,
                 use_peer_innovation=causal_innovation_use_peer,
+                )
             )
+
+    @property
+    def causal_innovation_corrector(self):
+        """Expose the motion-model-owned corrector to staged trainers."""
+        return self.decoder.motion_model.causal_innovation_corrector
 
     @staticmethod
     def _innovation_bundle(graph_data, residual):
@@ -434,6 +445,10 @@ class SGGT_Net(nn.Module):
         causal_demands = []
         residual = graph_data.residual.clone()
         innovation_bundle = self._innovation_bundle(graph_data, residual)
+        self.decoder.motion_model.causal_counterfactual_enabled = bool(
+            self.causal_innovation_correction
+            and (self.counterfactual_training or self.counterfactual_evaluation)
+        )
         x_update = input_tensor[:, -1:, :n_states]
         P_update = P_t[:, 0]
         measurement_innovation = input_tensor.new_zeros(node_count, 1, 2)
@@ -478,32 +493,20 @@ class SGGT_Net(nn.Module):
             decoded = self._decode(decoder_data)
             gasf_recurrent_state = decoded.gasf_recurrent_state
             if self.causal_innovation_correction:
-                base_state = decoded.next_state
-                correction, eligible, activation, demand = self.causal_innovation_corrector.predict(
-                    innovation_bundle
-                )
-                coordinate_scale = correction.new_tensor([
-                    1.0,
-                    1.0,
-                    float(self.causal_innovation_velocity_alpha),
-                    float(self.causal_innovation_velocity_alpha),
-                ])
-                correction = correction * coordinate_scale
-                expert_state = self.causal_innovation_corrector.apply_correction(
-                    base_state, correction, 1.0
-                )
-                selected_alpha = (
-                    activation if self.causal_innovation_dynamic_activation
-                    else self.causal_innovation_alpha
-                )
-                selected_state = self.causal_innovation_corrector.apply_correction(
-                    base_state, correction, selected_alpha
-                )
-                decoded = decoded._replace(next_state=selected_state)
-                counterfactual_base.append(base_state)
-                counterfactual_expert.append(expert_state)
+                correction = decoded.model_input[
+                    'causal_acceleration_correction'
+                ]
+                eligible = decoded.model_input['causal_innovation_eligible']
+                activation = decoded.model_input[
+                    'causal_innovation_activation'
+                ]
+                demand = decoded.model_input['causal_innovation_demand']
+                base_state = decoded.model_input.get('causal_base_state')
+                if base_state is not None:
+                    counterfactual_base.append(base_state)
+                    counterfactual_expert.append(decoded.next_state)
                 causal_corrections.append(correction)
-                causal_eligibility.append(eligible.unsqueeze(-1))
+                causal_eligibility.append(eligible)
                 causal_activations.append(activation)
                 causal_demands.append(demand)
             elif (
@@ -811,27 +814,8 @@ class SGGT_Net(nn.Module):
                     input_tensor.size(0), -1
                 ).any(dim=-1, keepdim=True),
             )
+        self.decoder.motion_model.causal_counterfactual_enabled = False
         decoded = self._decode(decoder_data)
-        if self.causal_innovation_correction:
-            correction, _, activation, _ = self.causal_innovation_corrector.predict(
-                innovation_bundle
-            )
-            coordinate_scale = correction.new_tensor([
-                1.0,
-                1.0,
-                float(self.causal_innovation_velocity_alpha),
-                float(self.causal_innovation_velocity_alpha),
-            ])
-            correction = correction * coordinate_scale
-            selected_alpha = (
-                activation if self.causal_innovation_dynamic_activation
-                else self.causal_innovation_alpha
-            )
-            decoded = decoded._replace(next_state=(
-                self.causal_innovation_corrector.apply_correction(
-                    decoded.next_state, correction, selected_alpha
-                )
-            ))
         G_t, _ = self.decoder.motion_model.input_transition_matrix(past_state, decoded.model_input)
         F_t = self._flow_jacobian(past_state, decoded.model_input)
         # Keep BP/inference covariance propagation identical to ``forward``.

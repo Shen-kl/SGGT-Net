@@ -219,6 +219,9 @@ if __name__ == '__main__':
                                   causal_innovation_correction=args.causal_innovation_correction,
                                   causal_innovation_history=args.causal_innovation_history,
                                   causal_innovation_hidden_size=args.causal_innovation_hidden_size,
+                                  causal_innovation_max_acceleration_mps2=(
+                                      args.causal_innovation_max_acceleration_mps2
+                                  ),
                                   causal_innovation_max_position_m=args.causal_innovation_max_position_m,
                                   causal_innovation_max_velocity_mps=args.causal_innovation_max_velocity_mps,
                                   causal_innovation_dynamic_activation=args.causal_innovation_dynamic_activation,
@@ -253,7 +256,7 @@ if __name__ == '__main__':
         initial = torch.load(args.init_checkpoint, map_location=args.device, weights_only=False)
         incompatible = track_model.load_state_dict(initial['state_dict'], strict=False)
         allowed_missing_prefixes = (
-            (('causal_innovation_corrector.',)
+            (('decoder.motion_model.causal_innovation_corrector.',)
              if args.causal_innovation_correction else ())
             + (('decoder.Q_innovation_encoder.',)
                if args.adaptive_q_mode != 'legacy' else ())
@@ -319,19 +322,15 @@ if __name__ == '__main__':
             parameter.requires_grad = False
         for parameter in track_model.causal_innovation_corrector.parameters():
             parameter.requires_grad = True
+        # Produce the frozen MPSIF/ODE counterfactual only during corrector
+        # identification. Deployment uses a single corrected RK4 solve.
+        track_model.counterfactual_training = True
+        track_model.counterfactual_evaluation = True
     elif args.training_stage == 'causal_innovation_gate':
-        if not args.causal_innovation_correction:
-            raise ValueError(
-                "causal_innovation_gate requires --causal_innovation_correction"
-            )
-        if not args.causal_innovation_dynamic_activation:
-            raise ValueError(
-                "causal_innovation_gate requires --causal_innovation_dynamic_activation"
-            )
-        for parameter in track_model.parameters():
-            parameter.requires_grad = False
-        for parameter in track_model.causal_innovation_corrector.selector.parameters():
-            parameter.requires_grad = True
+        raise ValueError(
+            "causal_innovation_gate was removed; acceleration CIPIC is always "
+            "active when its causal history is eligible"
+        )
     elif args.training_stage == 'expert' or staged_joint_finetune:
         for parameter in track_model.parameters():
             parameter.requires_grad = False

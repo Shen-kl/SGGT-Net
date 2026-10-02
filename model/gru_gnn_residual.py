@@ -1034,7 +1034,23 @@ class GRUGNNDecoderV2(nn.Module):
         # creates an erroneous [node, node, 2, 2] tensor for mixture=1.
         process_noise = process_noise * q_multiplier.unsqueeze(-1).unsqueeze(-1)
 
-        model_input = {'gnn_model_output': x4}
+        model_input = {
+            'gnn_model_output': x4,
+        }
+        if self.motion_model.causal_innovation_corrector is not None:
+            if innovation_bundle is None:
+                raise ValueError(
+                    "CIPIC requires a causal innovation history bundle"
+                )
+            # Deliberately expose only the four causal raw-history tensors to
+            # CIPIC. The complete innovation bundle remains available to the
+            # established MPSIF/Q paths above, but covariance, NIS, whitening
+            # and association descriptors cannot enter the correction branch
+            # even by accident.
+            model_input['causal_innovation_bundle'] = {
+                key: innovation_bundle[key]
+                for key in ('raw', 'peer_raw', 'valid', 'peer_valid')
+            }
         if self.use_GASF:
             model_input['GASF_output_fusion'] = gasf_features
             model_input['GASF_confidence'] = gasf_confidence

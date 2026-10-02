@@ -1039,3 +1039,30 @@ detections and clutter.
 
 Full evidence is in
 `results/association_context_decision_20260903/DECISION.md`.
+
+## 2026-10-02 - CIPIC direct-state correction was structurally ambiguous
+
+### Problem
+
+The previous CIPIC branch ran in parallel with MPSIF and added an independently
+predicted four-dimensional offset after RK4. It therefore could not observe
+what MPSIF had already corrected, and independent position/velocity offsets
+did not have to correspond to one acceleration-driven trajectory.
+
+### Measure
+
+On branch `feature/cipic-acceleration-rk4`, move CIPIC after the base
+acceleration computation: encode only causal raw own/peer innovation histories,
+condition on the interval-start base acceleration, predict a bounded 2-D
+acceleration residual, and inject it inside RK4. Remove the confidence gate,
+all whitening/covariance/NIS/association inputs, and all direct state offsets.
+Use exact zero initialization and train the corrector first against a frozen
+Temporal counterfactual.
+
+### Current conclusion
+
+Unit, CPU/GPU real-data, gradient, covariance, and one-epoch staged smoke tests
+are finite and the initial model exactly matches Temporal. The smoke is too
+small to establish an accuracy gain. A 200/50 own-only versus own-plus-peer
+test is required before the revised architecture can enter the manuscript or
+formal ablation table.

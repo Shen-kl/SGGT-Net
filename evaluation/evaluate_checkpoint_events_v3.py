@@ -48,11 +48,17 @@ def main():
     )
     parser.add_argument(
         "--causal_alpha", type=float, default=1.0,
-        help="operational causal-innovation correction scale; 0 is exact Temporal",
+        help=(
+            "legacy direct-state CIPIC option; acceleration-RK4 checkpoints "
+            "require the default value 1"
+        ),
     )
     parser.add_argument(
         "--causal_velocity_alpha", type=float, default=1.0,
-        help="scale only the direct velocity correction for coordinate ablation",
+        help=(
+            "legacy direct-state CIPIC option; acceleration-RK4 checkpoints "
+            "require the default value 1"
+        ),
     )
     parser.add_argument(
         "--association_augmentation", action="store_true",
@@ -94,6 +100,7 @@ def main():
     device = torch.device(cli.device)
     checkpoint_path = Path(cli.checkpoint).resolve()
     payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    causal_mode = payload.get("causal_innovation_mode")
     args = Args().initialize(Args().parse()).parse_args([])
     args.device = device
     args.decoder_use_GASF = bool(payload.get("decoder_use_GASF", True))
@@ -127,6 +134,9 @@ def main():
     )
     args.causal_innovation_hidden_size = int(
         payload.get("causal_innovation_hidden_size", 32)
+    )
+    args.causal_innovation_max_acceleration_mps2 = float(
+        payload.get("causal_innovation_max_acceleration_mps2", 5.0)
     )
     args.causal_innovation_max_position_m = float(
         payload.get("causal_innovation_max_position_m", 50.0)
@@ -271,10 +281,17 @@ def main():
     model.decoder.q_response_position_center = float(
         cli.q_response_position_center
     )
-    if args.causal_innovation_correction:
-        model.causal_innovation_alpha = float(cli.causal_alpha)
-        model.causal_innovation_velocity_alpha = float(
-            cli.causal_velocity_alpha
+    if (
+        args.causal_innovation_correction
+        and causal_mode == "acceleration_rk4_raw"
+        and (
+            float(cli.causal_alpha) != 1.0
+            or float(cli.causal_velocity_alpha) != 1.0
+        )
+    ):
+        raise ValueError(
+            "causal_alpha/causal_velocity_alpha do not apply to the "
+            "acceleration-RK4 CIPIC architecture"
         )
     model.eval()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
@@ -338,12 +355,12 @@ def main():
                 int(cli.association_seed) if cli.association_augmentation else None
             ),
             "operational_interaction": (
-                "learned_causal_activation"
+                "eligible_raw_innovation_acceleration_increment"
                 if (
                     args.causal_innovation_correction
-                    and args.causal_innovation_dynamic_activation
+                    and causal_mode == "acceleration_rk4_raw"
                 ) else (
-                    f"causal_innovation_alpha={float(cli.causal_alpha):g}"
+                    "legacy_causal_innovation_correction"
                     if args.causal_innovation_correction else (
                     "alpha=1" if args.innovation_decomposition
                     else "configured graph mode"
@@ -361,6 +378,10 @@ def main():
             ),
             "innovation_decomposition": args.innovation_decomposition,
             "causal_innovation_correction": args.causal_innovation_correction,
+            "causal_innovation_mode": causal_mode,
+            "causal_innovation_max_acceleration_mps2": float(
+                args.causal_innovation_max_acceleration_mps2
+            ),
             "causal_innovation_dynamic_activation": (
                 args.causal_innovation_dynamic_activation
             ),

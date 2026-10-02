@@ -71,7 +71,9 @@ def build_model(args):
         gasf_recurrent_gate_initial_update=getattr(
             args, "gasf_recurrent_gate_initial_update", 0.1
         ),
-        counterfactual_training=True,
+        counterfactual_training=getattr(
+            args, 'counterfactual_training', True
+        ),
         adaptive_q_mode=args.adaptive_q_mode,
         adaptive_q_max_multiplier=args.adaptive_q_max_multiplier,
         adaptive_q_max_position_variance=args.adaptive_q_max_position_variance,
@@ -92,6 +94,9 @@ def build_model(args):
         causal_innovation_history=getattr(args, 'causal_innovation_history', 8),
         causal_innovation_hidden_size=getattr(
             args, 'causal_innovation_hidden_size', 32
+        ),
+        causal_innovation_max_acceleration_mps2=getattr(
+            args, 'causal_innovation_max_acceleration_mps2', 5.0
         ),
         causal_innovation_max_position_m=getattr(
             args, 'causal_innovation_max_position_m', 50.0
@@ -169,7 +174,7 @@ def load_compatible_state_dict(model, state_dict):
         "decoder.GASF.innovation_uncertainty_encoder.",
         "decoder.GASF.innovation_decomposition_projection.",
         "decoder.GASF.parameter_update_gates.",
-        "causal_innovation_corrector.",
+        "decoder.motion_model.causal_innovation_corrector.",
     )
     invalid_missing = [
         key for key in incompatible.missing_keys
