@@ -219,6 +219,9 @@ if __name__ == '__main__':
                                   causal_innovation_correction=args.causal_innovation_correction,
                                   causal_innovation_history=args.causal_innovation_history,
                                   causal_innovation_hidden_size=args.causal_innovation_hidden_size,
+                                  causal_innovation_output_mode=(
+                                      args.causal_innovation_output_mode
+                                  ),
                                   causal_innovation_max_acceleration_mps2=(
                                       args.causal_innovation_max_acceleration_mps2
                                   ),

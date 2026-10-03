@@ -470,6 +470,9 @@ def main():
     args.causal_innovation_hidden_size = int(
         payload.get("causal_innovation_hidden_size", 32)
     )
+    args.causal_innovation_output_mode = payload.get(
+        "causal_innovation_output_mode", "acceleration"
+    )
     args.causal_innovation_max_acceleration_mps2 = float(
         payload.get("causal_innovation_max_acceleration_mps2", 5.0)
     )

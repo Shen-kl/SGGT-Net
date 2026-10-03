@@ -1529,19 +1529,44 @@ class Trainer:
                         float(eligible.sum() / denominator)
                     )
                     if eligible.any():
-                        acceleration = causal[eligible] * float(
-                            self.config["S_VEL"]
+                        output_mode = getattr(
+                            self.args,
+                            "causal_innovation_output_mode",
+                            "acceleration",
                         )
-                        metrics[
-                            "causal_innovation_acceleration_rms_mps2"
-                        ].append(
-                            float(acceleration.square().mean().sqrt())
-                        )
-                        metrics[
-                            "causal_innovation_acceleration_max_mps2"
-                        ].append(
-                            float(acceleration.abs().max())
-                        )
+                        if output_mode == "state_offset":
+                            position = causal[eligible, :2] * float(
+                                self.config["S_POS"]
+                            )
+                            velocity = causal[eligible, 2:] * float(
+                                self.config["S_VEL"]
+                            )
+                            metrics[
+                                "causal_innovation_position_rms_m"
+                            ].append(float(position.square().mean().sqrt()))
+                            metrics[
+                                "causal_innovation_position_max_m"
+                            ].append(float(position.abs().max()))
+                            metrics[
+                                "causal_innovation_velocity_rms_mps"
+                            ].append(float(velocity.square().mean().sqrt()))
+                            metrics[
+                                "causal_innovation_velocity_max_mps"
+                            ].append(float(velocity.abs().max()))
+                        else:
+                            acceleration = causal[eligible] * float(
+                                self.config["S_VEL"]
+                            )
+                            metrics[
+                                "causal_innovation_acceleration_rms_mps2"
+                            ].append(
+                                float(acceleration.square().mean().sqrt())
+                            )
+                            metrics[
+                                "causal_innovation_acceleration_max_mps2"
+                            ].append(
+                                float(acceleration.abs().max())
+                            )
                 association_population = outputs.real_mask[:, 0].bool()
                 if association_population.any():
                     mass = outputs.association_detection_mass[
@@ -2041,7 +2066,18 @@ class Trainer:
             "causal_innovation_hidden_size": int(getattr(
                 self.args, "causal_innovation_hidden_size", 32
             )),
-            "causal_innovation_mode": "acceleration_rk4_raw",
+            "causal_innovation_output_mode": getattr(
+                self.args, "causal_innovation_output_mode", "acceleration"
+            ),
+            "causal_innovation_mode": (
+                "state_offset_raw_fair"
+                if getattr(
+                    self.args,
+                    "causal_innovation_output_mode",
+                    "acceleration",
+                ) == "state_offset"
+                else "acceleration_rk4_raw"
+            ),
             "causal_innovation_max_acceleration_mps2": float(getattr(
                 self.args, "causal_innovation_max_acceleration_mps2", 5.0
             )),

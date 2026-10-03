@@ -300,25 +300,43 @@ class GroupTrackMotionModelBase(nn.Module):
             correction, eligible, activation, demand = corrector.predict(
                 innovation, base_acceleration
             )
-            inputs['causal_acceleration_correction'] = correction
+            inputs['causal_innovation_correction'] = correction
+            if corrector.output_mode == 'acceleration':
+                inputs['causal_acceleration_correction'] = correction
+            else:
+                inputs['causal_state_correction'] = correction
             inputs['causal_innovation_eligible'] = eligible.unsqueeze(-1)
             inputs['causal_innovation_activation'] = activation
             inputs['causal_innovation_demand'] = demand
             inputs['causal_base_acceleration'] = base_acceleration.mean(dim=1)
-            if self.causal_counterfactual_enabled:
+            base_state = None
+            if (
+                self.causal_counterfactual_enabled
+                or corrector.output_mode == 'state_offset'
+            ):
                 base_inputs = dict(inputs)
                 base_inputs.pop('causal_acceleration_correction', None)
-                inputs['causal_base_state'] = self.solver(
+                base_inputs.pop('causal_state_correction', None)
+                base_inputs.pop('causal_innovation_correction', None)
+                base_state = self.solver(
                     self.model_update,
                     past_state,
                     base_inputs,
                     static_f,
                     self.dt,
                 )
+                if self.causal_counterfactual_enabled:
+                    inputs['causal_base_state'] = base_state
 
-        next_state = self.solver(
-            self.model_update, past_state, inputs, static_f, self.dt
-        )
+        if (
+            corrector is not None
+            and corrector.output_mode == 'state_offset'
+        ):
+            next_state = base_state + correction.unsqueeze(1)
+        else:
+            next_state = self.solver(
+                self.model_update, past_state, inputs, static_f, self.dt
+            )
         return next_state, inputs
 
     def state_transition_matrix(self, X, inp, static_f=None):

@@ -95,6 +95,9 @@ def build_model(args):
         causal_innovation_hidden_size=getattr(
             args, 'causal_innovation_hidden_size', 32
         ),
+        causal_innovation_output_mode=getattr(
+            args, 'causal_innovation_output_mode', 'acceleration'
+        ),
         causal_innovation_max_acceleration_mps2=getattr(
             args, 'causal_innovation_max_acceleration_mps2', 5.0
         ),

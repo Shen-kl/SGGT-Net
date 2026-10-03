@@ -246,13 +246,21 @@ class Args:
                             help='apply an 8-frame own/leave-one-out peer innovation prior correction')
         parser.add_argument('--causal_innovation_history', default=8, type=int)
         parser.add_argument('--causal_innovation_hidden_size', default=32, type=int)
+        parser.add_argument(
+            '--causal_innovation_output_mode', default='acceleration',
+            choices=['acceleration', 'state_offset'],
+            help=(
+                'CIPIC output parameterization; state_offset is a controlled '
+                'diagnostic against the RK4 acceleration implementation'
+            ),
+        )
         parser.add_argument('--causal_innovation_max_acceleration_mps2', default=5.0,
                             type=float,
                             help='physical per-axis bound for the CIPIC acceleration increment')
         parser.add_argument('--causal_innovation_max_position_m', default=50.0, type=float,
-                            help='deprecated state-correction compatibility option')
+                            help='per-axis endpoint position bound for state_offset diagnostic')
         parser.add_argument('--causal_innovation_max_velocity_mps', default=5.0, type=float,
-                            help='deprecated state-correction compatibility option')
+                            help='per-axis endpoint velocity bound for state_offset diagnostic')
         parser.add_argument('--causal_innovation_dynamic_activation', default=False,
                             action=argparse.BooleanOptionalAction,
                             help='select the frozen causal innovation expert with a learned strictly-causal activation')

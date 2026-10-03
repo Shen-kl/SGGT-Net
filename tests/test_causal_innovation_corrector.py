@@ -216,6 +216,55 @@ class CausalInnovationCorrectorTests(unittest.TestCase):
         )
         self.assertTrue(torch.isfinite(transition).all())
 
+    def test_state_offset_diagnostic_changes_only_the_rk4_endpoint(self):
+        motion = GroupTrackFullModel(
+            solver="rk4",
+            dt=2.0,
+            mixtures=1,
+            static_f_dim=0,
+            n_hidden=8,
+            n_layers=2,
+            use_SEAN=False,
+            use_GASF=False,
+        ).eval()
+        corrector = CausalGroupInnovationCorrector(
+            hidden_size=8,
+            output_mode="state_offset",
+            max_position_m=50.0,
+            max_velocity_mps=5.0,
+            position_scale=float(CONFIG["S_POS"]),
+            velocity_scale=float(CONFIG["S_VEL"]),
+        ).eval()
+        bias = torch.tensor([0.2, -0.1, 0.3, -0.2])
+        with torch.no_grad():
+            corrector.fusion[-1].bias.copy_(bias)
+        motion.causal_innovation_corrector = corrector
+        motion.causal_counterfactual_enabled = True
+        state = torch.zeros(1, 1, 4)
+        predicted, prepared = motion(
+            state,
+            {
+                "gnn_model_output": torch.zeros(1, 8),
+                "causal_innovation_bundle": self._bundle(nodes=1),
+            },
+            static_f=None,
+        )
+        expected = torch.tanh(bias).view(1, 1, 4) * torch.tensor([
+            50.0 / float(CONFIG["S_POS"]),
+            50.0 / float(CONFIG["S_POS"]),
+            5.0 / float(CONFIG["S_VEL"]),
+            5.0 / float(CONFIG["S_VEL"]),
+        ]).view(1, 1, 4)
+        torch.testing.assert_close(
+            predicted - prepared["causal_base_state"], expected
+        )
+        torch.testing.assert_close(
+            prepared["causal_state_correction"].unsqueeze(1), expected
+        )
+        self.assertNotIn("causal_acceleration_correction", prepared)
+        transition, _ = motion.state_transition_matrix(state, prepared)
+        self.assertTrue(torch.isfinite(transition).all())
+
 
 if __name__ == "__main__":
     unittest.main()

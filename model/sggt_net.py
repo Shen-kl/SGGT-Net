@@ -111,9 +111,8 @@ class SGGT_Net(nn.Module):
         causal_innovation_correction=False,
         causal_innovation_history=8,
         causal_innovation_hidden_size=32,
+        causal_innovation_output_mode="acceleration",
         causal_innovation_max_acceleration_mps2=5.0,
-        # Deprecated state-correction options retained in the constructor so
-        # legacy launch scripts fail by protocol rather than by signature.
         causal_innovation_max_position_m=50.0,
         causal_innovation_max_velocity_mps=5.0,
         causal_innovation_dynamic_activation=False,
@@ -224,6 +223,9 @@ class SGGT_Net(nn.Module):
             clutter_requires_detection=association_clutter_requires_detection,
         )
         self.causal_innovation_correction = bool(causal_innovation_correction)
+        self.causal_innovation_output_mode = str(
+            causal_innovation_output_mode
+        )
         self.causal_innovation_dynamic_activation = bool(
             causal_innovation_dynamic_activation
         )
@@ -232,20 +234,24 @@ class SGGT_Net(nn.Module):
                 raise ValueError("causal innovation correction requires SGGT-V2")
             if self.causal_innovation_dynamic_activation:
                 raise ValueError(
-                    "CIPIC acceleration correction has no confidence gate"
+                    "CIPIC correction has no confidence gate"
                 )
             if causal_innovation_association_context:
                 raise ValueError(
-                    "CIPIC acceleration correction uses raw own/peer histories only"
+                    "CIPIC correction uses raw own/peer histories only"
                 )
             self.decoder.motion_model.causal_innovation_corrector = (
                 CausalGroupInnovationCorrector(
                 history_length=causal_innovation_history,
                 hidden_size=causal_innovation_hidden_size,
                 raw_scale=CONFIG['S_RES'],
+                output_mode=self.causal_innovation_output_mode,
                 max_acceleration_mps2=(
                     causal_innovation_max_acceleration_mps2
                 ),
+                max_position_m=causal_innovation_max_position_m,
+                max_velocity_mps=causal_innovation_max_velocity_mps,
+                position_scale=CONFIG['S_POS'],
                 velocity_scale=CONFIG['S_VEL'],
                 minimum_valid_history=causal_innovation_minimum_valid_history,
                 recent_valid_window=causal_innovation_recent_valid_window,
@@ -494,7 +500,7 @@ class SGGT_Net(nn.Module):
             gasf_recurrent_state = decoded.gasf_recurrent_state
             if self.causal_innovation_correction:
                 correction = decoded.model_input[
-                    'causal_acceleration_correction'
+                    'causal_innovation_correction'
                 ]
                 eligible = decoded.model_input['causal_innovation_eligible']
                 activation = decoded.model_input[

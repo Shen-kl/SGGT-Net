@@ -33,6 +33,11 @@ def main():
     parser.add_argument("--innovation-decomposition", action="store_true")
     parser.add_argument("--association-augmentation", action="store_true")
     parser.add_argument("--causal-innovation", action="store_true")
+    parser.add_argument(
+        "--causal-output-mode",
+        choices=("acceleration", "state_offset"),
+        default="acceleration",
+    )
     parser.add_argument("--device", default="cpu")
     options = parser.parse_args()
 
@@ -61,6 +66,7 @@ def main():
         interaction_gate_temperature=1e-3, interaction_gate_margin=1e-5,
         output_dir="./checkpoint",
         association_augmentation=options.association_augmentation,
+        causal_innovation_output_mode=options.causal_output_mode,
     )
     config = dict(CONFIG)
     config.update({"output_graph_window_len": 1, "S_VEL": 40.0,
@@ -97,6 +103,7 @@ def main():
         ),
         innovation_decomposition=options.innovation_decomposition,
         causal_innovation_correction=options.causal_innovation,
+        causal_innovation_output_mode=options.causal_output_mode,
         causal_innovation_max_acceleration_mps2=5.0,
         # One real online innovation is sufficient for this two-step smoke;
         # formal training retains the configured four-frame eligibility rule.
@@ -171,7 +178,13 @@ def main():
     assert torch.isfinite(trainer.last_loss_tensors["q_baseline"])
     assert torch.allclose(second_window.residual[:, -1], expected_innovation)
     if options.causal_innovation:
-        assert output.causal_innovation_correction.shape[-1] == 2
+        expected_dimension = (
+            4 if options.causal_output_mode == "state_offset" else 2
+        )
+        assert (
+            output.causal_innovation_correction.shape[-1]
+            == expected_dimension
+        )
         assert torch.isfinite(output.causal_innovation_correction).all()
         assert output.counterfactual_base.numel() > 0
         torch.testing.assert_close(

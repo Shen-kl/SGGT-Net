@@ -1,18 +1,19 @@
-"""Causal own/peer innovation acceleration correction for SGGT-V2."""
+"""Causal own/peer innovation correction diagnostics for SGGT-V2."""
 
 import torch
 import torch.nn as nn
 
 
 class CausalGroupInnovationCorrector(nn.Module):
-    """Predict a bounded acceleration increment from strictly past innovations.
+    """Predict a bounded correction from strictly past innovations.
 
     The corrector intentionally consumes only raw own/leave-one-out peer
     innovation histories plus the base acceleration at the beginning of the
     prediction interval.  It does not consume whitened innovations, NIS,
     innovation covariance, association confidence, or a learned activation
-    gate.  Its two-dimensional output is expressed in normalized acceleration
-    units and is added inside the same ODE that is integrated by RK4.
+    gate.  The primary mode predicts a two-dimensional acceleration increment
+    inside RK4.  ``state_offset`` is a controlled diagnostic that changes only
+    the output parameterization and injects a four-dimensional endpoint offset.
     """
 
     def __init__(
@@ -20,7 +21,11 @@ class CausalGroupInnovationCorrector(nn.Module):
         history_length=8,
         hidden_size=32,
         raw_scale=110.0,
+        output_mode="acceleration",
         max_acceleration_mps2=5.0,
+        max_position_m=50.0,
+        max_velocity_mps=5.0,
+        position_scale=1500.0,
         velocity_scale=300.0,
         minimum_valid_history=None,
         recent_valid_window=3,
@@ -29,6 +34,7 @@ class CausalGroupInnovationCorrector(nn.Module):
         super().__init__()
         self.history_length = int(history_length)
         self.raw_scale = float(raw_scale)
+        self.output_mode = str(output_mode)
         self.minimum_valid_history = (
             None if minimum_valid_history is None
             else int(minimum_valid_history)
@@ -41,8 +47,16 @@ class CausalGroupInnovationCorrector(nn.Module):
             raise ValueError("raw_scale must be positive")
         if max_acceleration_mps2 <= 0.0:
             raise ValueError("max_acceleration_mps2 must be positive")
+        if max_position_m <= 0.0 or max_velocity_mps <= 0.0:
+            raise ValueError("state-correction bounds must be positive")
+        if position_scale <= 0.0:
+            raise ValueError("position_scale must be positive")
         if velocity_scale <= 0.0:
             raise ValueError("velocity_scale must be positive")
+        if self.output_mode not in {"acceleration", "state_offset"}:
+            raise ValueError(
+                "output_mode must be 'acceleration' or 'state_offset'"
+            )
         if (
             self.minimum_valid_history is not None
             and not 1 <= self.minimum_valid_history <= self.history_length
@@ -62,6 +76,25 @@ class CausalGroupInnovationCorrector(nn.Module):
             "maximum_normalized_acceleration",
             torch.tensor(maximum_normalized_acceleration, dtype=torch.float32),
         )
+        if self.output_mode == "acceleration":
+            maximum_normalized_output = torch.full(
+                (2,), maximum_normalized_acceleration, dtype=torch.float32
+            )
+            output_dimension = 2
+        else:
+            maximum_normalized_output = torch.tensor(
+                [
+                    float(max_position_m) / float(position_scale),
+                    float(max_position_m) / float(position_scale),
+                    float(max_velocity_mps) / float(velocity_scale),
+                    float(max_velocity_mps) / float(velocity_scale),
+                ],
+                dtype=torch.float32,
+            )
+            output_dimension = 4
+        self.register_buffer(
+            "maximum_normalized_output", maximum_normalized_output
+        )
 
         raw_dimension = self.history_length * 2
         self.own_encoder = self._encoder(raw_dimension, hidden_size)
@@ -71,7 +104,7 @@ class CausalGroupInnovationCorrector(nn.Module):
         self.fusion = nn.Sequential(
             nn.Linear(2 * hidden_size + 2, 2 * hidden_size),
             nn.SiLU(),
-            nn.Linear(2 * hidden_size, 2),
+            nn.Linear(2 * hidden_size, output_dimension),
         )
         # Exact degeneration to the temporal MPSIF predictor at initialization.
         nn.init.zeros_(self.fusion[-1].weight)
@@ -157,10 +190,10 @@ class CausalGroupInnovationCorrector(nn.Module):
         return feature, eligible
 
     def predict(self, innovation, base_acceleration):
-        """Return a normalized acceleration increment and diagnostics."""
+        """Return a normalized correction and causal-history diagnostics."""
         feature, eligible = self._features(innovation, base_acceleration)
         correction = torch.tanh(self.fusion(feature))
-        correction = correction * self.maximum_normalized_acceleration.to(
+        correction = correction * self.maximum_normalized_output.to(
             correction
         )
         correction = torch.where(

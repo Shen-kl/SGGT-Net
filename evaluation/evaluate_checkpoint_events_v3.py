@@ -49,15 +49,15 @@ def main():
     parser.add_argument(
         "--causal_alpha", type=float, default=1.0,
         help=(
-            "legacy direct-state CIPIC option; acceleration-RK4 checkpoints "
-            "require the default value 1"
+            "legacy compatibility option; current raw-innovation CIPIC "
+            "checkpoints require the default value 1"
         ),
     )
     parser.add_argument(
         "--causal_velocity_alpha", type=float, default=1.0,
         help=(
-            "legacy direct-state CIPIC option; acceleration-RK4 checkpoints "
-            "require the default value 1"
+            "legacy compatibility option; current raw-innovation CIPIC "
+            "checkpoints require the default value 1"
         ),
     )
     parser.add_argument(
@@ -134,6 +134,14 @@ def main():
     )
     args.causal_innovation_hidden_size = int(
         payload.get("causal_innovation_hidden_size", 32)
+    )
+    args.causal_innovation_output_mode = payload.get(
+        "causal_innovation_output_mode",
+        (
+            "state_offset"
+            if payload.get("causal_innovation_mode") == "state_offset_raw_fair"
+            else "acceleration"
+        ),
     )
     args.causal_innovation_max_acceleration_mps2 = float(
         payload.get("causal_innovation_max_acceleration_mps2", 5.0)
@@ -283,7 +291,9 @@ def main():
     )
     if (
         args.causal_innovation_correction
-        and causal_mode == "acceleration_rk4_raw"
+        and causal_mode in {
+            "acceleration_rk4_raw", "state_offset_raw_fair"
+        }
         and (
             float(cli.causal_alpha) != 1.0
             or float(cli.causal_velocity_alpha) != 1.0
@@ -291,7 +301,7 @@ def main():
     ):
         raise ValueError(
             "causal_alpha/causal_velocity_alpha do not apply to the "
-            "acceleration-RK4 CIPIC architecture"
+            "current raw-innovation CIPIC architectures"
         )
     model.eval()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
@@ -360,10 +370,16 @@ def main():
                     args.causal_innovation_correction
                     and causal_mode == "acceleration_rk4_raw"
                 ) else (
+                    "eligible_raw_innovation_state_offset"
+                    if (
+                        args.causal_innovation_correction
+                        and causal_mode == "state_offset_raw_fair"
+                    ) else (
                     "legacy_causal_innovation_correction"
                     if args.causal_innovation_correction else (
                     "alpha=1" if args.innovation_decomposition
                     else "configured graph mode"
+                    )
                     )
                 )
             ),
