@@ -2069,6 +2069,9 @@ class Trainer:
             "causal_innovation_output_mode": getattr(
                 self.args, "causal_innovation_output_mode", "acceleration"
             ),
+            "causal_innovation_state_channels": getattr(
+                self.args, "causal_innovation_state_channels", "full"
+            ),
             "causal_innovation_mode": (
                 "state_offset_raw_fair"
                 if getattr(

@@ -254,6 +254,14 @@ class Args:
                 'diagnostic against the RK4 acceleration implementation'
             ),
         )
+        parser.add_argument(
+            '--causal_innovation_state_channels', default='full',
+            choices=['full', 'position_only', 'velocity_only'],
+            help=(
+                'fixed active channels for the four-dimensional state_offset '
+                'diagnostic; the full output head is retained in every arm'
+            ),
+        )
         parser.add_argument('--causal_innovation_max_acceleration_mps2', default=5.0,
                             type=float,
                             help='physical per-axis bound for the CIPIC acceleration increment')

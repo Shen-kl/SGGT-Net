@@ -197,6 +197,9 @@ if __name__ == '__main__':
                                  causal_innovation_output_mode=(
                                      args.causal_innovation_output_mode
                                  ),
+                                 causal_innovation_state_channels=(
+                                     args.causal_innovation_state_channels
+                                 ),
                                  causal_innovation_max_acceleration_mps2=(
                                      args.causal_innovation_max_acceleration_mps2
                                  ),

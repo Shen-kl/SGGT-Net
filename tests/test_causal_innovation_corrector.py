@@ -265,6 +265,34 @@ class CausalInnovationCorrectorTests(unittest.TestCase):
         transition, _ = motion.state_transition_matrix(state, prepared)
         self.assertTrue(torch.isfinite(transition).all())
 
+    def test_state_channel_ablation_keeps_head_size_and_masks_outputs(self):
+        modules = {
+            channels: CausalGroupInnovationCorrector(
+                hidden_size=8,
+                output_mode="state_offset",
+                state_channels=channels,
+                position_scale=float(CONFIG["S_POS"]),
+                velocity_scale=float(CONFIG["S_VEL"]),
+            ).eval()
+            for channels in ("full", "position_only", "velocity_only")
+        }
+        parameter_counts = {
+            channels: sum(parameter.numel() for parameter in module.parameters())
+            for channels, module in modules.items()
+        }
+        self.assertEqual(len(set(parameter_counts.values())), 1)
+        bundle = self._bundle()
+        base_acceleration = self._base_acceleration()
+        for module in modules.values():
+            with torch.no_grad():
+                module.fusion[-1].bias.fill_(0.2)
+        position, _ = modules["position_only"](bundle, base_acceleration)
+        velocity, _ = modules["velocity_only"](bundle, base_acceleration)
+        self.assertGreater(position[:, :2].abs().sum().item(), 0.0)
+        self.assertEqual(position[:, 2:].abs().max().item(), 0.0)
+        self.assertEqual(velocity[:, :2].abs().max().item(), 0.0)
+        self.assertGreater(velocity[:, 2:].abs().sum().item(), 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,6 +3,8 @@ param(
     [int]$ValSamples = 50,
     [int]$Epochs = 10,
     [int]$Seed = 123,
+    [ValidateSet("full", "position_only", "velocity_only")]
+    [string]$StateChannels = "full",
     [double]$MaxPositionM = 50.0,
     [double]$MaxVelocityMps = 5.0,
     [string]$TemporalCheckpoint = (
@@ -62,6 +64,7 @@ $arguments = @(
     "--causal_innovation_history", "8",
     "--causal_innovation_hidden_size", "32",
     "--causal_innovation_output_mode", "state_offset",
+    "--causal_innovation_state_channels", $StateChannels,
     "--causal_innovation_max_acceleration_mps2", "5",
     "--causal_innovation_max_position_m", "$MaxPositionM",
     "--causal_innovation_max_velocity_mps", "$MaxVelocityMps",
@@ -88,7 +91,7 @@ $arguments = @(
 )
 
 Write-Output (
-    "START $RunName mode=state_offset own_peer train=$TrainSamples " +
+    "START $RunName mode=state_offset/$StateChannels own_peer train=$TrainSamples " +
     "val=$ValSamples epochs=$Epochs seed=$Seed position_bound=$MaxPositionM " +
     "velocity_bound=$MaxVelocityMps at $(Get-Date -Format o)"
 )

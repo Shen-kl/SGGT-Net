@@ -22,6 +22,7 @@ class CausalGroupInnovationCorrector(nn.Module):
         hidden_size=32,
         raw_scale=110.0,
         output_mode="acceleration",
+        state_channels="full",
         max_acceleration_mps2=5.0,
         max_position_m=50.0,
         max_velocity_mps=5.0,
@@ -35,6 +36,7 @@ class CausalGroupInnovationCorrector(nn.Module):
         self.history_length = int(history_length)
         self.raw_scale = float(raw_scale)
         self.output_mode = str(output_mode)
+        self.state_channels = str(state_channels)
         self.minimum_valid_history = (
             None if minimum_valid_history is None
             else int(minimum_valid_history)
@@ -56,6 +58,17 @@ class CausalGroupInnovationCorrector(nn.Module):
         if self.output_mode not in {"acceleration", "state_offset"}:
             raise ValueError(
                 "output_mode must be 'acceleration' or 'state_offset'"
+            )
+        if self.state_channels not in {
+            "full", "position_only", "velocity_only"
+        }:
+            raise ValueError(
+                "state_channels must be 'full', 'position_only', or "
+                "'velocity_only'"
+            )
+        if self.output_mode == "acceleration" and self.state_channels != "full":
+            raise ValueError(
+                "state channel ablations require output_mode='state_offset'"
             )
         if (
             self.minimum_valid_history is not None
@@ -81,6 +94,7 @@ class CausalGroupInnovationCorrector(nn.Module):
                 (2,), maximum_normalized_acceleration, dtype=torch.float32
             )
             output_dimension = 2
+            output_channel_mask = torch.ones(2, dtype=torch.float32)
         else:
             maximum_normalized_output = torch.tensor(
                 [
@@ -92,8 +106,23 @@ class CausalGroupInnovationCorrector(nn.Module):
                 dtype=torch.float32,
             )
             output_dimension = 4
+            output_channel_mask = {
+                "full": torch.ones(4, dtype=torch.float32),
+                "position_only": torch.tensor(
+                    [1.0, 1.0, 0.0, 0.0], dtype=torch.float32
+                ),
+                "velocity_only": torch.tensor(
+                    [0.0, 0.0, 1.0, 1.0], dtype=torch.float32
+                ),
+            }[self.state_channels]
         self.register_buffer(
             "maximum_normalized_output", maximum_normalized_output
+        )
+        # The mask is a protocol setting rather than learned/checkpoint state.
+        # Keeping it non-persistent also permits evaluation of the previously
+        # trained full-output diagnostic checkpoint.
+        self.register_buffer(
+            "output_channel_mask", output_channel_mask, persistent=False
         )
 
         raw_dimension = self.history_length * 2
@@ -196,6 +225,7 @@ class CausalGroupInnovationCorrector(nn.Module):
         correction = correction * self.maximum_normalized_output.to(
             correction
         )
+        correction = correction * self.output_channel_mask.to(correction)
         correction = torch.where(
             eligible.unsqueeze(-1), correction, torch.zeros_like(correction)
         )

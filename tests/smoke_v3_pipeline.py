@@ -38,6 +38,11 @@ def main():
         choices=("acceleration", "state_offset"),
         default="acceleration",
     )
+    parser.add_argument(
+        "--causal-state-channels",
+        choices=("full", "position_only", "velocity_only"),
+        default="full",
+    )
     parser.add_argument("--device", default="cpu")
     options = parser.parse_args()
 
@@ -67,6 +72,7 @@ def main():
         output_dir="./checkpoint",
         association_augmentation=options.association_augmentation,
         causal_innovation_output_mode=options.causal_output_mode,
+        causal_innovation_state_channels=options.causal_state_channels,
     )
     config = dict(CONFIG)
     config.update({"output_graph_window_len": 1, "S_VEL": 40.0,
@@ -104,6 +110,7 @@ def main():
         innovation_decomposition=options.innovation_decomposition,
         causal_innovation_correction=options.causal_innovation,
         causal_innovation_output_mode=options.causal_output_mode,
+        causal_innovation_state_channels=options.causal_state_channels,
         causal_innovation_max_acceleration_mps2=5.0,
         # One real online innovation is sufficient for this two-step smoke;
         # formal training retains the configured four-frame eligibility rule.

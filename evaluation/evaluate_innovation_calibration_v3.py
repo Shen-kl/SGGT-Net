@@ -473,6 +473,9 @@ def main():
     args.causal_innovation_output_mode = payload.get(
         "causal_innovation_output_mode", "acceleration"
     )
+    args.causal_innovation_state_channels = payload.get(
+        "causal_innovation_state_channels", "full"
+    )
     args.causal_innovation_max_acceleration_mps2 = float(
         payload.get("causal_innovation_max_acceleration_mps2", 5.0)
     )

@@ -112,6 +112,7 @@ class SGGT_Net(nn.Module):
         causal_innovation_history=8,
         causal_innovation_hidden_size=32,
         causal_innovation_output_mode="acceleration",
+        causal_innovation_state_channels="full",
         causal_innovation_max_acceleration_mps2=5.0,
         causal_innovation_max_position_m=50.0,
         causal_innovation_max_velocity_mps=5.0,
@@ -226,6 +227,9 @@ class SGGT_Net(nn.Module):
         self.causal_innovation_output_mode = str(
             causal_innovation_output_mode
         )
+        self.causal_innovation_state_channels = str(
+            causal_innovation_state_channels
+        )
         self.causal_innovation_dynamic_activation = bool(
             causal_innovation_dynamic_activation
         )
@@ -246,6 +250,7 @@ class SGGT_Net(nn.Module):
                 hidden_size=causal_innovation_hidden_size,
                 raw_scale=CONFIG['S_RES'],
                 output_mode=self.causal_innovation_output_mode,
+                state_channels=self.causal_innovation_state_channels,
                 max_acceleration_mps2=(
                     causal_innovation_max_acceleration_mps2
                 ),
