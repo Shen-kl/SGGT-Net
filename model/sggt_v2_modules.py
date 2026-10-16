@@ -1,3 +1,4 @@
+import math
 from typing import NamedTuple
 
 import torch
@@ -44,6 +45,7 @@ class SpectralOutput(NamedTuple):
     parameter_step_norms: torch.Tensor
     filter_response_step_rms: torch.Tensor
     recurrent_transition_valid: torch.Tensor
+    spectral_calibration_loss: torch.Tensor
 
 
 def _upper_triangle(matrix: torch.Tensor) -> torch.Tensor:
@@ -316,6 +318,10 @@ class JointGraphTemporalSpectralFilter(nn.Module):
     parameter candidate and a learned scalar gate applies
     ``p_k = p_{k-1} + z_k * (candidate_k - p_{k-1})``.  First/reborn frames
     bypass this recurrence and establish a fresh causal state.
+
+    The parameterized ABC and GLP/Wiener MPSIF branches use ``fft_points``
+    samples for a zero-padded one-sided FFT (64 by default), while the
+    unconstrained learned ablation keeps its historical window-length transform.
     """
 
     def __init__(
@@ -333,6 +339,10 @@ class JointGraphTemporalSpectralFilter(nn.Module):
         innovation_whiten_clip: float = 20.0,
         recurrent_filter: bool = False,
         recurrent_gate_initial_update: float = 0.1,
+        abc_c_limit: float | None = None,
+        glp_p_min: float = 1.0,
+        glp_p_max: float = 3.0,
+        fft_points: int = 64,
     ):
         super().__init__()
         # Evaluation-only causal intervention. `None` uses the learned SEAN
@@ -359,6 +369,25 @@ class JointGraphTemporalSpectralFilter(nn.Module):
         self.innovation_decomposition = bool(innovation_decomposition)
         self.innovation_whiten_clip = float(innovation_whiten_clip)
         self.recurrent_filter = bool(recurrent_filter)
+        # Evaluation may override these two attributes when loading an ABC
+        # checkpoint produced before the 256-point, adaptive-DC response was
+        # introduced. New training always uses the current definition.
+        self.abc_zero_pad_fft = True
+        self.abc_normalize_dc = False
+        self.abc_c_limit = (
+            None if abc_c_limit is None else float(abc_c_limit)
+        )
+        if self.abc_c_limit is not None and self.abc_c_limit <= 0.0:
+            raise ValueError("ABC c limit must be positive when enabled")
+        self.glp_p_min = float(glp_p_min)
+        self.glp_p_max = float(glp_p_max)
+        if not 0.0 < self.glp_p_min < self.glp_p_max:
+            raise ValueError("GLP exponent bounds must satisfy 0 < min < max")
+        self.fft_points = int(fft_points)
+        if self.fft_points < max(self.windows) or self.fft_points < 2:
+            raise ValueError(
+                "GLP FFT points must be at least the largest causal window"
+            )
         self.hidden_dim = int(hidden_dim)
         self.recurrent_gate_initial_update = float(
             recurrent_gate_initial_update
@@ -374,19 +403,56 @@ class JointGraphTemporalSpectralFilter(nn.Module):
             raise ValueError(f"Unsupported GASF graph mode: {graph_mode}")
         self.graph_mode = graph_mode
         self.last_filter_diagnostics = []
+        self.last_effective_filter_diagnostics = {}
         self.last_context_activation_features = None
         self.last_innovation_diagnostics = {}
         self.last_innovation_details = {}
-        self.frequency_filters = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Linear(2, hidden_dim // 2),
-                    nn.SiLU(),
-                    nn.Linear(hidden_dim // 2, self.chebyshev_order + 1),
-                )
-                for _ in self.windows
-            ]
-        )
+        if self.filter_mode not in {"abc", "glp_wiener", "learned"}:
+            raise ValueError(f"Unsupported GASF filter mode: {self.filter_mode}")
+        self.frequency_filters = nn.ModuleList()
+        self.shared_frequency_filter = None
+        if self.filter_mode == "glp_wiener":
+            # Full, time-shift-invariant spectral descriptor per scale:
+            # per-axis normalized power, total normalized power, (for xy)
+            # real/imaginary cross-spectral coherence, log RMS, and the
+            # per-axis energy share. Every rFFT bin is retained.
+            per_bin_features = self.signal_dim + 1
+            if self.signal_dim == 2:
+                per_bin_features += 2
+            descriptor_dim = sum(
+                per_bin_features * (self.fft_points // 2 + 1)
+                + 1
+                + self.signal_dim
+                for _window in self.windows
+            ) + 2
+            shared_hidden = max(8, hidden_dim)
+            self.shared_frequency_filter = nn.Sequential(
+                nn.LayerNorm(descriptor_dim),
+                nn.Linear(descriptor_dim, shared_hidden),
+                nn.SiLU(),
+                nn.Linear(shared_hidden, max(4, hidden_dim // 2)),
+                nn.SiLU(),
+                nn.Linear(max(4, hidden_dim // 2), 3),
+            )
+            final = self.shared_frequency_filter[-1]
+            nn.init.xavier_uniform_(final.weight, gain=0.02)
+            initial_lambda = 0.5
+            inverse_softplus = math.log(math.expm1(initial_lambda))
+            with torch.no_grad():
+                final.bias.copy_(torch.tensor([
+                    0.0, inverse_softplus, 0.0,
+                ], dtype=final.bias.dtype))
+        else:
+            self.frequency_filters.extend(
+                [
+                    nn.Sequential(
+                        nn.Linear(2, hidden_dim // 2),
+                        nn.SiLU(),
+                        nn.Linear(hidden_dim // 2, self.chebyshev_order + 1),
+                    )
+                    for _ in self.windows
+                ]
+            )
         recurrent_hidden = max(1, hidden_dim // 2)
         # The recurrent state is deliberately restricted to the preceding ABC
         # parameters.  One scalar update coefficient changes the complete
@@ -394,16 +460,28 @@ class JointGraphTemporalSpectralFilter(nn.Module):
         # ABC values, and current history validity.  No previous spectral
         # latent is stored or used by this experiment.
         recurrent_gate_input = 2 + (self.chebyshev_order + 1) + 1
-        self.parameter_update_gates = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Linear(recurrent_gate_input, recurrent_hidden),
-                    nn.SiLU(),
-                    nn.Linear(recurrent_hidden, 1),
-                )
-                for _ in self.windows
-            ]
-        )
+        self.parameter_update_gates = nn.ModuleList()
+        if self.filter_mode == "glp_wiener":
+            descriptor_dim = self.shared_frequency_filter[0].normalized_shape[0]
+            shared_parameter_update_gate = nn.Sequential(
+                nn.Linear(descriptor_dim + 3 + 1, recurrent_hidden),
+                nn.SiLU(),
+                nn.Linear(recurrent_hidden, 1),
+            )
+            self.parameter_update_gates.append(
+                shared_parameter_update_gate
+            )
+        else:
+            self.parameter_update_gates.extend(
+                [
+                    nn.Sequential(
+                        nn.Linear(recurrent_gate_input, recurrent_hidden),
+                        nn.SiLU(),
+                        nn.Linear(recurrent_hidden, 1),
+                    )
+                    for _ in self.windows
+                ]
+            )
         gate_bias = torch.logit(torch.tensor(self.recurrent_gate_initial_update))
         for gate_network in self.parameter_update_gates:
             nn.init.xavier_uniform_(gate_network[-1].weight, gain=0.05)
@@ -555,6 +633,297 @@ class JointGraphTemporalSpectralFilter(nn.Module):
         output.index_add_(0, target, features[source] * norm.view(view_shape))
         return output
 
+    @staticmethod
+    def _scale_sequence_and_spectrum(
+        residual: torch.Tensor,
+        window: int,
+        fft_points: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the right-aligned causal window and its complex spectrum."""
+        sequence = residual[:, -window:, :]
+        if sequence.size(1) < window:
+            sequence = F.pad(sequence, (0, 0, window - sequence.size(1), 0))
+        sequence = torch.nan_to_num(sequence)
+        n_fft = window if fft_points is None else int(fft_points)
+        spectrum = torch.fft.rfft(sequence.transpose(1, 2), n=n_fft, dim=-1)
+        return sequence, spectrum
+
+    def _glp_gain(
+        self,
+        parameters: torch.Tensor,
+        frequencies: torch.Tensor,
+    ) -> torch.Tensor:
+        """Smooth low-pass response gamma * exp(-lambda * f**p)."""
+        gamma, attenuation, exponent = torch.split(parameters, 1, dim=-1)
+        return gamma * torch.exp(
+            -attenuation * frequencies.clamp_min(0.0).pow(exponent)
+        )
+
+    def _glp_shared_parameters(
+        self,
+        residual: torch.Tensor,
+        node_entropy: torch.Tensor,
+        valid_ratio: torch.Tensor,
+        previous_filter_parameters: torch.Tensor,
+        continuing_state: torch.Tensor,
+    ):
+        """Infer one response from the complete spectra of all time scales."""
+        descriptor_parts = []
+        prepared_scales = []
+        for window in self.windows:
+            sequence, spectrum = self._scale_sequence_and_spectrum(
+                residual, window, self.fft_points
+            )
+            # Keep every rFFT bin but describe it through power and relative
+            # cross-channel phase. An absolute complex phase changes under a
+            # harmless shift of the causal time origin, whereas a spectral
+            # response should be shift invariant. The relative cross-spectrum
+            # retains directional coupling between the two innovation axes.
+            rms = sequence.square().mean(
+                dim=(1, 2), keepdim=True
+            ).sqrt().clamp_min(1e-6)
+            power = spectrum.abs().square()
+            channel_energy = power.sum(dim=-1).clamp_min(1e-8)
+            channel_distribution = power / channel_energy.unsqueeze(-1)
+            total_power = power.sum(dim=1)
+            total_distribution = total_power / total_power.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(1e-8)
+            descriptor_parts.append(
+                channel_distribution.flatten(start_dim=1)
+            )
+            descriptor_parts.append(total_distribution)
+            if self.signal_dim == 2:
+                cross = spectrum[:, 0] * spectrum[:, 1].conj()
+                cross_scale = (
+                    power[:, 0] * power[:, 1]
+                ).sqrt().clamp_min(1e-8)
+                descriptor_parts.append(
+                    torch.stack(
+                        (cross.real / cross_scale, cross.imag / cross_scale),
+                        dim=1,
+                    ).flatten(start_dim=1)
+                )
+            descriptor_parts.append(torch.log1p(rms.flatten(start_dim=1)))
+            descriptor_parts.append(
+                channel_energy / channel_energy.sum(
+                    dim=-1, keepdim=True
+                ).clamp_min(1e-8)
+            )
+            prepared_scales.append((sequence, spectrum))
+        descriptor = torch.cat(
+            descriptor_parts + [node_entropy, valid_ratio], dim=-1
+        )
+        descriptor = torch.nan_to_num(descriptor)
+        raw_parameters = self.shared_frequency_filter(descriptor)
+        candidate_parameters = torch.cat(
+            (
+                torch.sigmoid(raw_parameters[:, 0:1]),
+                F.softplus(raw_parameters[:, 1:2]).clamp_max(20.0),
+                self.glp_p_min
+                + (self.glp_p_max - self.glp_p_min)
+                * torch.sigmoid(raw_parameters[:, 2:3]),
+            ),
+            dim=-1,
+        )
+
+        # GLP uses one physical response for all scales. Existing recurrent
+        # state keeps a per-scale layout for checkpoint/API compatibility.
+        previous_parameters = previous_filter_parameters.mean(dim=1)
+        previous_valid = continuing_state.all(dim=1)
+        previous_mask = previous_valid.to(residual.dtype)
+        if self.recurrent_filter:
+            if self.parameter_update_gate_override is None:
+                proposed_gate = torch.sigmoid(
+                    self.parameter_update_gates[0](torch.cat(
+                        (
+                            descriptor,
+                            previous_parameters,
+                            valid_ratio,
+                        ),
+                        dim=-1,
+                    ))
+                )
+            else:
+                override = float(self.parameter_update_gate_override)
+                if not 0.0 <= override <= 1.0:
+                    raise ValueError(
+                        "parameter_update_gate_override must be in [0, 1]"
+                    )
+                proposed_gate = torch.full_like(previous_mask, override)
+            update_gate = torch.where(
+                previous_valid, proposed_gate, torch.ones_like(proposed_gate)
+            )
+            parameters = previous_parameters + update_gate * (
+                candidate_parameters - previous_parameters
+            )
+        else:
+            update_gate = torch.ones_like(previous_mask)
+            parameters = candidate_parameters
+        with torch.no_grad():
+            parameter_step = torch.where(
+                previous_valid,
+                torch.linalg.vector_norm(
+                    parameters - previous_parameters,
+                    dim=-1,
+                    keepdim=True,
+                ),
+                torch.zeros_like(update_gate),
+            )
+        return (
+            parameters,
+            descriptor,
+            prepared_scales,
+            update_gate,
+            parameter_step,
+            previous_parameters,
+            previous_valid,
+        )
+
+    def _filter_glp_scale(
+        self,
+        sequence: torch.Tensor,
+        spectrum: torch.Tensor,
+        window: int,
+        temporal_encoder: nn.Module,
+        parameters: torch.Tensor,
+        previous_parameters: torch.Tensor,
+        previous_valid: torch.Tensor,
+        valid_ratio: torch.Tensor,
+        update_gate: torch.Tensor,
+        parameter_step: torch.Tensor,
+    ):
+        frequencies = torch.linspace(
+            0,
+            1,
+            spectrum.size(-1),
+            device=spectrum.device,
+            dtype=sequence.dtype,
+        ).unsqueeze(0)
+        gain = self._glp_gain(parameters, frequencies).clamp(0.0, 1.0)
+        filtered_full = torch.fft.irfft(
+            spectrum * gain.unsqueeze(1), n=self.fft_points, dim=-1
+        )
+        filtered_sequence = filtered_full[..., :window]
+        temporal_latent = temporal_encoder(filtered_sequence).squeeze(-1)
+
+        # A causal, label-free Wiener proxy anchors the learned response. The
+        # high-frequency median estimates the white innovation floor; excess
+        # power is treated as predictable low-frequency motion. cummin makes
+        # the target compatible with the monotone GLP response. Positive bins
+        # receive more weight so rare maneuvers cannot be ignored by an
+        # all-zero solution on predominantly steady trajectories.
+        power = spectrum.abs().square().sum(dim=1) / float(window * window)
+        high_start = max(1, power.size(-1) // 2)
+        noise_floor = power[:, high_start:].median(
+            dim=-1, keepdim=True
+        ).values
+        wiener_target = (
+            (power - noise_floor).clamp_min(0.0) / power.clamp_min(1e-8)
+        )
+        wiener_target = torch.cummin(wiener_target, dim=-1).values.detach()
+        calibration_weight = 1.0 + 4.0 * wiener_target
+        per_node_calibration = (
+            calibration_weight * (gain - wiener_target).square()
+        ).sum(dim=-1) / calibration_weight.sum(dim=-1).clamp_min(1e-6)
+        valid_weight = valid_ratio[:, 0].clamp(0.0, 1.0)
+        spectral_response_loss = (
+            per_node_calibration * valid_weight
+        ).sum() / valid_weight.sum().clamp_min(1.0)
+        # Pointwise regression alone is minimized quickly by the population
+        # average response. Match the *relative* retention across nodes in the
+        # current causal batch as well, so a constant filter cannot satisfy the
+        # calibration objective. This remains label-free: both sides are
+        # computed from the current innovation spectrum.
+        predicted_retention = gain.mean(dim=-1)
+        target_retention = wiener_target.mean(dim=-1)
+        valid_sum = valid_weight.sum().clamp_min(1.0)
+        predicted_mean = (
+            predicted_retention * valid_weight
+        ).sum() / valid_sum
+        target_mean = (target_retention * valid_weight).sum() / valid_sum
+        predicted_centered = predicted_retention - predicted_mean
+        target_centered = target_retention - target_mean
+        target_variance = (
+            target_centered.square() * valid_weight
+        ).sum() / valid_sum
+        centered_error = (
+            (predicted_centered - target_centered).square() * valid_weight
+        ).sum() / valid_sum
+        spectral_adaptation_loss = torch.where(
+            target_variance > 1e-6,
+            centered_error / target_variance.clamp_min(1e-6),
+            centered_error.new_zeros(()),
+        )
+        spectral_calibration_loss = (
+            spectral_response_loss + spectral_adaptation_loss
+        )
+        with torch.no_grad():
+            covariance = (
+                predicted_centered * target_centered * valid_weight
+            ).sum() / valid_sum
+            predicted_variance = (
+                predicted_centered.square() * valid_weight
+            ).sum() / valid_sum
+            response_target_correlation = covariance / torch.sqrt(
+                predicted_variance * target_variance + 1e-8
+            )
+
+        with torch.no_grad():
+            previous_gain = self._glp_gain(
+                previous_parameters, frequencies
+            ).clamp(0.0, 1.0)
+            response_step = torch.where(
+                previous_valid,
+                (gain - previous_gain).square().mean(
+                    dim=-1, keepdim=True
+                ).sqrt(),
+                torch.zeros_like(update_gate),
+            )
+        diagnostic_valid = valid_ratio[:, 0] > 0
+        if not diagnostic_valid.any():
+            diagnostic_valid = torch.ones_like(diagnostic_valid)
+        gamma, attenuation, exponent = torch.split(parameters, 1, dim=-1)
+        split = max(1, power.size(-1) // 2)
+        low_energy = power[:, :split].mean(dim=-1, keepdim=True)
+        high_energy = power[:, split:].mean(dim=-1, keepdim=True)
+        diagnostics = {
+            'lowpass_dc_gain': gain[diagnostic_valid, 0].detach().mean(),
+            'lowpass_nyquist_gain': gain[
+                diagnostic_valid, -1
+            ].detach().mean(),
+            'lowpass_mean_gain': gain[diagnostic_valid].detach().mean(),
+            'low_high_energy_ratio': (
+                low_energy / (low_energy + high_energy + 1e-8)
+            )[diagnostic_valid].detach().mean(),
+            'gamma': gamma[diagnostic_valid].detach().mean(),
+            'lambda': attenuation[diagnostic_valid].detach().mean(),
+            'p': exponent[diagnostic_valid].detach().mean(),
+            'wiener_target_mean': wiener_target[
+                diagnostic_valid
+            ].mean(),
+            'spectral_response_loss': spectral_response_loss.detach(),
+            'spectral_adaptation_loss': spectral_adaptation_loss.detach(),
+            'response_target_correlation': (
+                response_target_correlation.detach()
+            ),
+            'spectral_calibration_loss': spectral_calibration_loss.detach(),
+            'allpass_fraction_099': (
+                gain[diagnostic_valid, -1].detach() >= 0.99
+            ).to(gain.dtype).mean(),
+            'c_saturation_fraction': gain.new_tensor(float('nan')),
+            '_nyquist_gain_per_node': gain[:, -1].detach(),
+            'parameter_update_gate': update_gate.detach().mean(),
+            'parameter_step_norm': parameter_step.detach().mean(),
+            'filter_response_step_rms': response_step.detach().mean(),
+        }
+        return (
+            temporal_latent,
+            diagnostics,
+            spectral_calibration_loss,
+            response_step,
+        )
+
     def _filter_scale(
         self,
         residual: torch.Tensor,
@@ -572,7 +941,16 @@ class JointGraphTemporalSpectralFilter(nn.Module):
             sequence = F.pad(sequence, (0, 0, window - sequence.size(1), 0))
         sequence = torch.nan_to_num(sequence)
 
-        spectrum = torch.fft.rfft(sequence.transpose(1, 2), n=window, dim=-1)
+        # Both parameterized MPSIF variants use the configured zero-padded
+        # spectrum.  The unconstrained learned legacy branch retains its
+        # historical window-length transform for ablation compatibility.
+        if self.filter_mode == "learned":
+            n_fft = window
+        elif self.filter_mode == "abc" and not self.abc_zero_pad_fft:
+            n_fft = window
+        else:
+            n_fft = self.fft_points
+        spectrum = torch.fft.rfft(sequence.transpose(1, 2), n=n_fft, dim=-1)
         if self.filter_mode == "learned":
             spectral_features = torch.view_as_real(spectrum).permute(0, 2, 1, 3)
             filtered_complex = torch.view_as_complex(
@@ -588,6 +966,9 @@ class JointGraphTemporalSpectralFilter(nn.Module):
                 'parameter_update_gate': residual.new_tensor(1.0),
                 'parameter_step_norm': residual.new_tensor(0.0),
                 'filter_response_step_rms': residual.new_tensor(float('nan')),
+                '_nyquist_gain_per_node': residual.new_full(
+                    (residual.size(0),), float('nan')
+                ),
             }, residual.new_zeros(residual.size(0), 3), residual.new_ones(
                 residual.size(0), 1
             ), residual.new_zeros(residual.size(0), 1), residual.new_zeros(
@@ -607,11 +988,18 @@ class JointGraphTemporalSpectralFilter(nn.Module):
         spectral_descriptor = torch.cat([energy_ratio, node_entropy], dim=-1)
         previous_mask = previous_valid.to(residual.dtype)
         candidate_raw_parameters = filter_network(spectral_descriptor)
+        candidate_c = candidate_raw_parameters[:, 2:3]
+        if self.abc_c_limit is not None:
+            # A soft bound prevents c from driving both sigmoids into the
+            # saturated all-pass regime while preserving unit slope around
+            # zero.  None deliberately retains exact legacy behavior.
+            limit = self.abc_c_limit
+            candidate_c = limit * torch.tanh(candidate_c / limit)
         candidate_parameters = torch.cat(
             (
                 -F.softplus(candidate_raw_parameters[:, 0:1]),
                 -F.softplus(candidate_raw_parameters[:, 1:2]),
-                candidate_raw_parameters[:, 2:3],
+                candidate_c,
             ),
             dim=-1,
         )
@@ -648,12 +1036,15 @@ class JointGraphTemporalSpectralFilter(nn.Module):
             0, 1, spectrum.size(-1), device=residual.device, dtype=residual.dtype
         ).unsqueeze(0)
         gain = torch.sigmoid(a * frequencies.square() + b * frequencies + c)
-        # Preserve DC and phase: one real gain multiplies the complete complex
-        # coefficient for both measurement axes.
-        gain = (gain / torch.sigmoid(c).clamp_min(1e-4)).clamp(0.0, 1.0)
-        filtered_sequence = torch.fft.irfft(
-            spectrum * gain.unsqueeze(1), n=window, dim=-1
+        if self.abc_normalize_dc:
+            gain = (gain / torch.sigmoid(c).clamp_min(1e-4)).clamp(0.0, 1.0)
+        # One real-valued response multiplies the complete complex coefficient
+        # for both measurement axes, preserving spectral phase.  The DC gain
+        # remains adaptive through c instead of being normalized to one.
+        filtered_full = torch.fft.irfft(
+            spectrum * gain.unsqueeze(1), n=n_fft, dim=-1
         )
+        filtered_sequence = filtered_full[..., :window]
         temporal_latent = temporal_encoder(filtered_sequence).squeeze(-1)
         with torch.no_grad():
             previous_a, previous_b, previous_c = torch.split(
@@ -664,10 +1055,10 @@ class JointGraphTemporalSpectralFilter(nn.Module):
                 + previous_b * frequencies
                 + previous_c
             )
-            previous_gain = (
-                previous_gain
-                / torch.sigmoid(previous_c).clamp_min(1e-4)
-            ).clamp(0.0, 1.0)
+            if self.abc_normalize_dc:
+                previous_gain = (
+                    previous_gain / torch.sigmoid(previous_c).clamp_min(1e-4)
+                ).clamp(0.0, 1.0)
             response_step = (gain - previous_gain).square().mean(
                 dim=-1, keepdim=True
             ).sqrt()
@@ -681,14 +1072,28 @@ class JointGraphTemporalSpectralFilter(nn.Module):
                 ),
                 torch.zeros_like(response_step),
             )
+        diagnostic_valid = valid_ratio[:, 0] > 0
+        if not diagnostic_valid.any():
+            diagnostic_valid = torch.ones_like(diagnostic_valid)
         diagnostics = {
-            'lowpass_dc_gain': gain[:, 0].detach().mean(),
-            'lowpass_nyquist_gain': gain[:, -1].detach().mean(),
-            'lowpass_mean_gain': gain.detach().mean(),
-            'low_high_energy_ratio': energy_ratio.detach().mean(),
-            'a': a.detach().mean(),
-            'b': b.detach().mean(),
-            'c': c.detach().mean(),
+            'lowpass_dc_gain': gain[diagnostic_valid, 0].detach().mean(),
+            'lowpass_nyquist_gain': gain[
+                diagnostic_valid, -1
+            ].detach().mean(),
+            'lowpass_mean_gain': gain[diagnostic_valid].detach().mean(),
+            'low_high_energy_ratio': energy_ratio[
+                diagnostic_valid
+            ].detach().mean(),
+            'a': a[diagnostic_valid].detach().mean(),
+            'b': b[diagnostic_valid].detach().mean(),
+            'c': c[diagnostic_valid].detach().mean(),
+            'allpass_fraction_099': (
+                gain[diagnostic_valid, -1].detach() >= 0.99
+            ).to(gain.dtype).mean(),
+            'c_saturation_fraction': (
+                c[diagnostic_valid].detach().abs() >= 4.0
+            ).to(gain.dtype).mean(),
+            '_nyquist_gain_per_node': gain[:, -1].detach(),
             'parameter_update_gate': parameter_update_gate.detach().mean(),
             'parameter_step_norm': parameter_step.detach().mean(),
             'filter_response_step_rms': response_step.detach().mean(),
@@ -714,7 +1119,13 @@ class JointGraphTemporalSpectralFilter(nn.Module):
         if sequence.size(1) < window:
             sequence = F.pad(sequence, (0, 0, window - sequence.size(1), 0))
         sequence = torch.nan_to_num(sequence)
-        spectrum = torch.fft.rfft(sequence.transpose(1, 2), n=window, dim=-1)
+        if self.filter_mode == "learned":
+            n_fft = window
+        elif self.filter_mode == "abc" and not self.abc_zero_pad_fft:
+            n_fft = window
+        else:
+            n_fft = self.fft_points
+        spectrum = torch.fft.rfft(sequence.transpose(1, 2), n=n_fft, dim=-1)
         if self.filter_mode == "abc":
             a, b, c = torch.split(parameters, 1, dim=-1)
             frequencies = torch.linspace(
@@ -727,11 +1138,23 @@ class JointGraphTemporalSpectralFilter(nn.Module):
             gain = torch.sigmoid(
                 a * frequencies.square() + b * frequencies + c
             )
-            gain = (
-                gain / torch.sigmoid(c).clamp_min(1e-4)
-            ).clamp(0.0, 1.0)
+            if self.abc_normalize_dc:
+                gain = (
+                    gain / torch.sigmoid(c).clamp_min(1e-4)
+                ).clamp(0.0, 1.0)
             spectrum = spectrum * gain.unsqueeze(1)
-        filtered_sequence = torch.fft.irfft(spectrum, n=window, dim=-1)
+        elif self.filter_mode == "glp_wiener":
+            frequencies = torch.linspace(
+                0,
+                1,
+                spectrum.size(-1),
+                device=residual.device,
+                dtype=residual.dtype,
+            ).unsqueeze(0)
+            gain = self._glp_gain(parameters, frequencies).clamp(0.0, 1.0)
+            spectrum = spectrum * gain.unsqueeze(1)
+        filtered_full = torch.fft.irfft(spectrum, n=n_fft, dim=-1)
+        filtered_sequence = filtered_full[..., :window]
         return temporal_encoder(filtered_sequence).squeeze(-1)
 
     def _decompose_innovation(
@@ -1039,44 +1462,107 @@ class JointGraphTemporalSpectralFilter(nn.Module):
         parameter_update_gates = []
         parameter_step_norms = []
         filter_response_steps = []
-        for index, (
-            window,
-            filter_network,
-            temporal_encoder,
-            scorer,
-            update_gate_network,
-        ) in enumerate(zip(
-            self.windows,
-            self.frequency_filters,
-            self.temporal_encoders,
-            self.scale_scorers,
-            self.parameter_update_gates,
-        )):
+        if self.filter_mode == "glp_wiener":
             (
-                latent,
-                diagnostics,
-                parameters,
-                update_gate,
-                parameter_step,
-                response_step,
-            ) = self._filter_scale(
+                shared_parameters,
+                _,
+                prepared_scales,
+                shared_update_gate,
+                shared_parameter_step,
+                previous_shared_parameters,
+                previous_shared_valid,
+            ) = self._glp_shared_parameters(
                 residual,
+                node_entropy,
+                valid_ratio,
+                previous_filter_parameters,
+                continuing_state,
+            )
+            spectral_calibration_losses = []
+            for index, (
+                window,
+                prepared,
+                temporal_encoder,
+                scorer,
+            ) in enumerate(zip(
+                self.windows,
+                prepared_scales,
+                self.temporal_encoders,
+                self.scale_scorers,
+            )):
+                sequence, spectrum = prepared
+                (
+                    latent,
+                    diagnostics,
+                    calibration_loss,
+                    response_step,
+                ) = self._filter_glp_scale(
+                    sequence,
+                    spectrum,
+                    window,
+                    temporal_encoder,
+                    shared_parameters,
+                    previous_shared_parameters,
+                    previous_shared_valid,
+                    valid_ratio,
+                    shared_update_gate,
+                    shared_parameter_step,
+                )
+                filter_diagnostics.append(diagnostics)
+                latents.append(latent)
+                filter_parameters.append(shared_parameters)
+                parameter_update_gates.append(shared_update_gate)
+                parameter_step_norms.append(shared_parameter_step)
+                filter_response_steps.append(response_step)
+                spectral_calibration_losses.append(calibration_loss)
+                scores.append(scorer(torch.cat(
+                    [latent, confidence_features], dim=-1
+                )))
+            spectral_calibration_loss = torch.stack(
+                spectral_calibration_losses
+            ).mean()
+        else:
+            spectral_calibration_loss = residual.new_tensor(0.0)
+            for index, (
                 window,
                 filter_network,
                 temporal_encoder,
-                node_entropy,
-                valid_ratio,
+                scorer,
                 update_gate_network,
-                previous_filter_parameters[:, index],
-                continuing_state[:, index],
-            )
-            filter_diagnostics.append(diagnostics)
-            latents.append(latent)
-            filter_parameters.append(parameters)
-            parameter_update_gates.append(update_gate)
-            parameter_step_norms.append(parameter_step)
-            filter_response_steps.append(response_step)
-            scores.append(scorer(torch.cat([latent, confidence_features], dim=-1)))
+            ) in enumerate(zip(
+                self.windows,
+                self.frequency_filters,
+                self.temporal_encoders,
+                self.scale_scorers,
+                self.parameter_update_gates,
+            )):
+                (
+                    latent,
+                    diagnostics,
+                    parameters,
+                    update_gate,
+                    parameter_step,
+                    response_step,
+                ) = self._filter_scale(
+                    residual,
+                    window,
+                    filter_network,
+                    temporal_encoder,
+                    node_entropy,
+                    valid_ratio,
+                    update_gate_network,
+                    previous_filter_parameters[:, index],
+                    continuing_state[:, index],
+                )
+                filter_diagnostics.append(diagnostics)
+                latents.append(latent)
+                filter_parameters.append(parameters)
+                parameter_update_gates.append(update_gate)
+                parameter_step_norms.append(parameter_step)
+                filter_response_steps.append(response_step)
+                scores.append(scorer(torch.cat(
+                    [latent, confidence_features], dim=-1
+                )))
 
         stacked_latents = torch.stack(latents, dim=1)
         stacked_filter_parameters = torch.stack(filter_parameters, dim=1)
@@ -1095,6 +1581,37 @@ class JointGraphTemporalSpectralFilter(nn.Module):
             recurrent_valid,
         )
         scale_weights = torch.softmax(torch.cat(scores, dim=-1), dim=-1)
+        nyquist_per_scale = torch.stack(
+            [
+                diagnostic['_nyquist_gain_per_node']
+                for diagnostic in filter_diagnostics
+            ],
+            dim=-1,
+        )
+        diagnostic_current_valid = current_recurrent_valid[:, 0]
+        if not diagnostic_current_valid.any():
+            diagnostic_current_valid = torch.ones_like(diagnostic_current_valid)
+        for index, diagnostic in enumerate(filter_diagnostics):
+            weight = scale_weights[:, index].detach()
+            valid_weight = weight[diagnostic_current_valid]
+            diagnostic['scale_weight_mean'] = valid_weight.mean()
+            diagnostic['scale_weight_std'] = valid_weight.std(unbiased=False)
+            diagnostic['effective_nyquist_contribution'] = (
+                weight[diagnostic_current_valid]
+                * nyquist_per_scale[diagnostic_current_valid, index]
+            ).mean()
+            diagnostic.pop('_nyquist_gain_per_node')
+        self.last_effective_filter_diagnostics = {
+            'effective_nyquist_gain': (
+                scale_weights.detach()[diagnostic_current_valid]
+                * nyquist_per_scale[diagnostic_current_valid]
+            ).sum(dim=-1).mean(),
+            'nyquist_scale_diversity': nyquist_per_scale[
+                diagnostic_current_valid
+            ].std(
+                dim=-1, unbiased=False
+            ).mean(),
+        }
         temporal_fused = (stacked_latents * scale_weights.unsqueeze(-1)).sum(dim=1)
         temporal_fused = self.output_projection(temporal_fused)
 
@@ -1277,5 +1794,6 @@ class JointGraphTemporalSpectralFilter(nn.Module):
             stacked_parameter_steps,
             stacked_response_steps,
             continuing_state.squeeze(-1),
+            spectral_calibration_loss,
         )
 

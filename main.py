@@ -178,6 +178,10 @@ if __name__ == '__main__':
                                  gasf_recurrent_gate_initial_update=(
                                      args.gasf_recurrent_gate_initial_update
                                  ),
+                                 gasf_abc_c_limit=args.gasf_abc_c_limit,
+                                 gasf_glp_p_min=args.gasf_glp_p_min,
+                                 gasf_glp_p_max=args.gasf_glp_p_max,
+                                 gasf_fft_points=args.gasf_fft_points,
                                  counterfactual_training=args.counterfactual_training,
                                  adaptive_q_mode=args.adaptive_q_mode,
                                  adaptive_q_max_multiplier=args.adaptive_q_max_multiplier,

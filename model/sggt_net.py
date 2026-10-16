@@ -65,6 +65,7 @@ class SGGTOutput(NamedTuple):
     association_valid: torch.Tensor
     gasf_recurrent_state: SpectralFilterState | None
     gasf_parameter_update_gates: torch.Tensor
+    gasf_spectral_calibration_loss: torch.Tensor
 
 
 class SGGT_Net(nn.Module):
@@ -108,6 +109,10 @@ class SGGT_Net(nn.Module):
         innovation_whiten_clip=20.0,
         gasf_recurrent_filter=False,
         gasf_recurrent_gate_initial_update=0.1,
+        gasf_abc_c_limit=None,
+        gasf_glp_p_min=1.0,
+        gasf_glp_p_max=3.0,
+        gasf_fft_points=64,
         causal_innovation_correction=False,
         causal_innovation_history=8,
         causal_innovation_hidden_size=32,
@@ -191,6 +196,10 @@ class SGGT_Net(nn.Module):
                 gasf_recurrent_gate_initial_update=(
                     gasf_recurrent_gate_initial_update
                 ),
+                gasf_abc_c_limit=gasf_abc_c_limit,
+                gasf_glp_p_min=gasf_glp_p_min,
+                gasf_glp_p_max=gasf_glp_p_max,
+                gasf_fft_points=gasf_fft_points,
             )
         else:
             self.decoder = decoder_type(*decoder_args)
@@ -402,6 +411,7 @@ class SGGT_Net(nn.Module):
             next_state.new_zeros(node_count, 2),
             None,
             next_state.new_zeros(node_count, 0),
+            next_state.new_tensor(0.0),
         )
 
     def forward(
@@ -449,6 +459,7 @@ class SGGT_Net(nn.Module):
         spectral_weights, node_entropy, auxiliary_delta_v, film_gate, group_count = [], [], [], [], []
         policy_gate, gasf_confidence = [], []
         gasf_parameter_update_gates = []
+        gasf_spectral_calibration_losses = []
         q_acceleration_multiplier, q_position_noise, q_innovation_score = [], [], []
         auxiliary_delta_v_temporal, auxiliary_delta_v_expert = [], []
         causal_corrections, causal_eligibility = [], []
@@ -604,6 +615,9 @@ class SGGT_Net(nn.Module):
             gasf_parameter_update_gates.append(
                 decoded.gasf_parameter_update_gates
             )
+            gasf_spectral_calibration_losses.append(
+                decoded.gasf_spectral_calibration_loss
+            )
             q_acceleration_multiplier.append(decoded.q_acceleration_multiplier)
             q_position_noise.append(decoded.q_position_noise)
             q_innovation_score.append(decoded.q_innovation_score)
@@ -748,6 +762,7 @@ class SGGT_Net(nn.Module):
             association_valid,
             gasf_recurrent_state,
             torch.stack(gasf_parameter_update_gates, dim=1),
+            torch.stack(gasf_spectral_calibration_losses),
         )
 
     def predict(

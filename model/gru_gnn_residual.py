@@ -507,6 +507,7 @@ class DecoderV2Output(NamedTuple):
     auxiliary_delta_v_expert: torch.Tensor
     gasf_recurrent_state: SpectralFilterState | None
     gasf_parameter_update_gates: torch.Tensor
+    gasf_spectral_calibration_loss: torch.Tensor
 
 
 class GRUGNNDecoderV2(nn.Module):
@@ -541,6 +542,10 @@ class GRUGNNDecoderV2(nn.Module):
         innovation_whiten_clip=20.0,
         gasf_recurrent_filter=False,
         gasf_recurrent_gate_initial_update=0.1,
+        gasf_abc_c_limit=None,
+        gasf_glp_p_min=1.0,
+        gasf_glp_p_max=3.0,
+        gasf_fft_points=64,
     ):
         super().__init__()
         self.gru_cell = GRUGNNCell(
@@ -602,12 +607,14 @@ class GRUGNNDecoderV2(nn.Module):
         )
         self.time_decay = nn.Parameter(torch.tensor(0.1))
         self.linear_2 = nn.Linear(hidden_size * 2, hidden_size)
-        self.Q_scaler = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
+        # Process-noise prediction must observe the same MPSIF evidence that
+        # corrects the motion prior.  Keep this fusion local to the Q branch so
+        # the spectral feature is not injected into the ODE dynamics twice.
+        self.Q_mpsif_fusion = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.SiLU(),
-            nn.Linear(hidden_size, 1),
-            nn.Sigmoid(),
+            nn.Linear(hidden_size, hidden_size),
         )
         # Q-v2 is strictly causal: ``residual`` contains innovations only up to
         # the preceding observed frame.  The final layer is initialized so an
@@ -700,6 +707,10 @@ class GRUGNNDecoderV2(nn.Module):
                 recurrent_gate_initial_update=(
                     gasf_recurrent_gate_initial_update
                 ),
+                abc_c_limit=gasf_abc_c_limit,
+                glp_p_min=gasf_glp_p_min,
+                glp_p_max=gasf_glp_p_max,
+                fft_points=gasf_fft_points,
             )
         else:
             self.GASF = None
@@ -709,7 +720,7 @@ class GRUGNNDecoderV2(nn.Module):
         """Expose embedded SEAN for diagnostics and staged optimization."""
         return self.GASF.SEAN if self.GASF is not None else None
 
-    def process_noise_matrix(self, x1, x2, x3, batch_size, scale_features):
+    def process_noise_matrix(self, x1, x2, x3, batch_size):
         sig1 = F.softplus(self.sig_1(x1))
         sig2 = F.softplus(self.sig_2(x2))
         rho = F.softsign(self.rho(x3))
@@ -723,8 +734,16 @@ class GRUGNNDecoderV2(nn.Module):
         q_t[..., 0, 0] = sig1.square()
         q_t[..., 1, 1] = sig2.square()
         q_t[..., 0, 1] = q_t[..., 1, 0] = sig1 * sig2 * rho
-        noise_scale = self.Q_scaler(scale_features).unsqueeze(1).unsqueeze(1)
-        return noise_scale * q_t
+        return q_t
+
+    def fuse_q_features(self, hidden, mpsif_features):
+        """Fuse decoder and MPSIF features for process-noise prediction."""
+        if not self.use_GASF:
+            return hidden
+        q_increment = self.Q_mpsif_fusion(
+            torch.cat((hidden, mpsif_features), dim=-1)
+        )
+        return hidden + q_increment
 
     def _causal_nis_statistics(self, innovation_bundle, residual):
         """Summarize only innovations already present before prediction t."""
@@ -998,6 +1017,9 @@ class GRUGNNDecoderV2(nn.Module):
             )
             gasf_recurrent_state = spectral.recurrent_state
             gasf_parameter_update_gates = spectral.parameter_update_gates
+            gasf_spectral_calibration_loss = (
+                spectral.spectral_calibration_loss
+            )
         else:
             gasf_features = torch.zeros_like(hidden)
             gasf_confidence = torch.zeros(batch_size, 1, device=hidden.device)
@@ -1012,18 +1034,32 @@ class GRUGNNDecoderV2(nn.Module):
             gasf_parameter_update_gates = torch.zeros(
                 batch_size, 0, device=hidden.device
             )
+            gasf_spectral_calibration_loss = hidden.new_tensor(0.0)
 
+        # The motion feature x4 remains generated from the decoder state; the
+        # motion model performs its existing MPSIF fusion exactly once.  The Q
+        # heads instead use an explicit h_k/s_k fusion so process uncertainty
+        # is conditioned on the spectral model-mismatch evidence as well.
         generated = self.dropout(
             F.leaky_relu(
                 self.generator(F.leaky_relu(hidden, self.alpha)), self.alpha
             )
         )
-        x1, x2, x3, x4 = torch.split(generated, self.hidden_size, dim=-1)
-        # Keep the base dynamics and process-noise path identical to the
-        # no-SEAN baseline; SEAN controls only the residual GASF/FiLM path.
-        scale_features = hidden
+        _, _, _, x4 = torch.split(generated, self.hidden_size, dim=-1)
+        q_hidden = self.fuse_q_features(hidden, gasf_features)
+        if self.use_GASF:
+            q_generated = self.dropout(
+                F.leaky_relu(
+                    self.generator(F.leaky_relu(q_hidden, self.alpha)), self.alpha
+                )
+            )
+        else:
+            # Preserve the baseline path (including its dropout realization)
+            # when no MPSIF branch is present.
+            q_generated = generated
+        x1, x2, x3, _ = torch.split(q_generated, self.hidden_size, dim=-1)
         process_noise = self.process_noise_matrix(
-            x1, x2, x3, batch_size, scale_features
+            x1, x2, x3, batch_size
         )
         q_multiplier, q_position_noise, q_innovation_score = self.adaptive_process_noise(
             hidden, gasf_features, residual, innovation_bundle
@@ -1091,6 +1127,7 @@ class GRUGNNDecoderV2(nn.Module):
             auxiliary_delta_v_expert,
             gasf_recurrent_state,
             gasf_parameter_update_gates,
+            gasf_spectral_calibration_loss,
         )
 
     def get_initial_state(self, last_enc_state, data):

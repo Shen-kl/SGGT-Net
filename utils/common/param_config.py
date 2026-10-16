@@ -189,6 +189,11 @@ def param_config(
                                         "model_variant", "covariance_transition",
                                         "gasf_filter_mode", "gasf_graph_mode",
                                         "gasf_fusion_mode", "gasf_aux_source",
+                                        "gasf_recurrent_filter",
+                                        "gasf_recurrent_gate_initial_update",
+                                        "gasf_abc_c_limit",
+                                        "gasf_glp_p_min", "gasf_glp_p_max",
+                                        "gasf_fft_points",
                                         "adaptive_q_mode",
                                         "adaptive_q_max_multiplier",
                                         "adaptive_q_max_position_variance",
@@ -291,6 +296,15 @@ def param_config(
                                     load_compatible_state_dict(
                                         track_model, checkpoint_payload['state_dict']
                                     )
+                                    gasf = getattr(track_model.decoder, "GASF", None)
+                                    legacy_abc = (
+                                        gasf is not None
+                                        and getattr(args, "gasf_filter_mode", "abc") == "abc"
+                                        and "gasf_fft_points" not in checkpoint_payload
+                                    )
+                                    if gasf is not None:
+                                        gasf.abc_zero_pad_fft = not legacy_abc
+                                        gasf.abc_normalize_dc = legacy_abc
                                 else:
                                     track_model.load_state_dict(
                                         torch.load(args.checkpoint, map_location=args.device,weights_only=False)['state_dict'])

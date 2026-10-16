@@ -203,6 +203,10 @@ if __name__ == '__main__':
                                  gasf_recurrent_gate_initial_update=(
                                      args.gasf_recurrent_gate_initial_update
                                  ),
+                                 gasf_abc_c_limit=args.gasf_abc_c_limit,
+                                 gasf_glp_p_min=args.gasf_glp_p_min,
+                                 gasf_glp_p_max=args.gasf_glp_p_max,
+                                 gasf_fft_points=args.gasf_fft_points,
                                  counterfactual_training=args.counterfactual_training,
                                  adaptive_q_mode=args.adaptive_q_mode,
                                  adaptive_q_max_multiplier=args.adaptive_q_max_multiplier,
@@ -260,7 +264,33 @@ if __name__ == '__main__':
     track_model = track_model.to(args.device)
     if args.init_checkpoint:
         initial = torch.load(args.init_checkpoint, map_location=args.device, weights_only=False)
-        incompatible = track_model.load_state_dict(initial['state_dict'], strict=False)
+        initial_state = dict(initial['state_dict'])
+        selector_migration_prefixes = ()
+        if args.gasf_filter_mode == 'glp_wiener':
+            # GLP selector descriptors can evolve without invalidating the
+            # already trained encoder/ODE backbone. Reinitialize only tensors
+            # whose shape belongs to the selector; all other incompatibilities
+            # remain hard errors below.
+            selector_migration_prefixes = (
+                'decoder.GASF.shared_frequency_filter.',
+                'decoder.GASF.parameter_update_gates.',
+                'decoder.GASF.frequency_filters.',
+            )
+            target_state = track_model.state_dict()
+            migrated = []
+            for key in list(initial_state):
+                if not key.startswith(selector_migration_prefixes):
+                    continue
+                target = target_state.get(key)
+                if target is None or target.shape != initial_state[key].shape:
+                    initial_state.pop(key)
+                    migrated.append(key)
+            if migrated:
+                print(
+                    'Reinitialized incompatible GLP selector tensors: '
+                    f'{len(migrated)}'
+                )
+        incompatible = track_model.load_state_dict(initial_state, strict=False)
         allowed_missing_prefixes = (
             (('decoder.motion_model.causal_innovation_corrector.',)
              if args.causal_innovation_correction else ())
@@ -270,16 +300,27 @@ if __name__ == '__main__':
             # ablation arms so the common initialization and parameter count
             # remain identical. Legacy Temporal checkpoints predate them.
             + ('decoder.GASF.parameter_update_gates.',)
+            + (
+                ('decoder.GASF.shared_frequency_filter.',)
+                if args.gasf_filter_mode == 'glp_wiener' else ()
+            )
         )
         invalid_missing = [
             key for key in incompatible.missing_keys
             if not key.startswith(allowed_missing_prefixes)
         ]
-        if invalid_missing or incompatible.unexpected_keys:
+        invalid_unexpected = [
+            key for key in incompatible.unexpected_keys
+            if not (
+                args.gasf_filter_mode == 'glp_wiener'
+                and key.startswith('decoder.GASF.frequency_filters.')
+            )
+        ]
+        if invalid_missing or invalid_unexpected:
             raise RuntimeError(
                 "init checkpoint incompatibility: "
                 f"missing={invalid_missing}, "
-                f"unexpected={incompatible.unexpected_keys}"
+                f"unexpected={invalid_unexpected}"
             )
         print(
             f"Initialized from {args.init_checkpoint}; "
@@ -293,7 +334,36 @@ if __name__ == '__main__':
         and args.fusion_adapt_epochs > 0
     )
     args.staged_joint_finetune = staged_joint_finetune
-    if args.training_stage == 'filter_recurrence':
+    if args.training_stage == 'mpsif_calibration':
+        if (
+            not args.decoder_use_GASF
+            or args.gasf_filter_mode != 'glp_wiener'
+        ):
+            raise ValueError(
+                "mpsif_calibration requires GASF with glp_wiener mode"
+            )
+        for parameter in track_model.parameters():
+            parameter.requires_grad = False
+        for parameter in (
+            track_model.decoder.GASF.shared_frequency_filter.parameters()
+        ):
+            parameter.requires_grad = True
+        if args.gasf_recurrent_filter:
+            for parameter in (
+                track_model.decoder.GASF.parameter_update_gates.parameters()
+            ):
+                parameter.requires_grad = True
+        calibration_parameter_count = sum(
+            parameter.numel() for parameter in track_model.parameters()
+            if parameter.requires_grad
+        )
+        if calibration_parameter_count == 0:
+            raise RuntimeError("mpsif_calibration has no trainable parameters")
+        print(
+            "MPSIF spectral calibration stage: "
+            f"{calibration_parameter_count} trainable parameters"
+        )
+    elif args.training_stage == 'filter_recurrence':
         if not args.decoder_use_GASF or not args.gasf_recurrent_filter:
             raise ValueError(
                 "filter_recurrence requires GASF with recurrent ABC enabled"

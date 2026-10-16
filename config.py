@@ -159,7 +159,7 @@ class Args:
         parser.add_argument('--checkpoint_metric', default='composite',
                             choices=['composite', 'position', 'association_position',
                                      'prediction', 'expert',
-                                     'expert_strong', 'gate'],
+                                     'expert_strong', 'gate', 'spectral'],
                             help='Metric used for early stopping and final checkpoint loading')
         parser.add_argument('--optimizer_factor', default=0.8, type=float)
         parser.add_argument('--optimizer_patience', default=5, type=int)
@@ -225,7 +225,7 @@ class Args:
         parser.add_argument('--decoder_use_SEAN', default=True,
                             action=argparse.BooleanOptionalAction)
         parser.add_argument('--gasf_filter_mode', default='abc',
-                            choices=['abc', 'learned'],
+                            choices=['abc', 'glp_wiener', 'learned'],
                             help='Parametric low-pass or learned graph-polynomial spectral filter')
         parser.add_argument('--gasf_graph_mode', default='graph',
                             choices=['graph', 'temporal_only'],
@@ -236,6 +236,35 @@ class Args:
         parser.add_argument('--gasf_recurrent_gate_initial_update', default=0.1,
                             type=float,
                             help='initial candidate fraction of the recurrent ABC update gate')
+        parser.add_argument(
+            '--gasf_abc_c_limit', default=None, type=float,
+            help=(
+                'optional positive soft bound for the ABC offset c; '
+                'disabled by default to reproduce existing checkpoints exactly'
+            ),
+        )
+        parser.add_argument(
+            '--lambda_mpsif_spectral', default=0.0, type=float,
+            help=(
+                'weight of the label-free Wiener-response calibration loss; '
+                'used by gasf_filter_mode=glp_wiener'
+            ),
+        )
+        parser.add_argument(
+            '--gasf_glp_p_min', default=1.0, type=float,
+            help='minimum exponent of the gamma-lambda-p response',
+        )
+        parser.add_argument(
+            '--gasf_glp_p_max', default=3.0, type=float,
+            help='maximum exponent of the gamma-lambda-p response',
+        )
+        parser.add_argument(
+            '--gasf_fft_points', default=64, type=int,
+            help=(
+                'zero-padded FFT length for the parameterized MPSIF paths; '
+                'the unconstrained learned ablation keeps its window-length FFT'
+            ),
+        )
         parser.add_argument('--innovation_decomposition', default=False,
                             action=argparse.BooleanOptionalAction,
                             help='use EKF-whitened, SEAN soft-graph common/individual innovation features')
@@ -437,6 +466,7 @@ class Args:
                                      'graph_context_bridge',
                                      'physical_gain',
                                      'graph_fusion_adapt', 'filter_recurrence',
+                                     'mpsif_calibration',
                                      'gate', 'q_adapt',
                                      'causal_innovation_expert',
                                      'causal_innovation_gate',
